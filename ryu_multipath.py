@@ -12,11 +12,13 @@ from ryu.lib.packet import ipv4
 from ryu.lib.packet import ipv6
 from ryu.lib.packet import ether_types
 from ryu.lib import mac, ip
-from ryu.topology.api import get_switch, get_link
+from ryu.topology.api import get_switch, get_link, get_all_switch, get_all_host, get_all_link
 from ryu.app.wsgi import ControllerBase
 from ryu.topology import event
+import networkx as nx
 
 from collections import defaultdict
+from ryu.topology.event import EventSwitchEnter, EventSwitchReconnected
 from operator import itemgetter
 
 import os
@@ -25,10 +27,9 @@ import time
 
 # Cisco Reference bandwidth = 1 Gbps
 REFERENCE_BW = 10000000
+DEFAULT_BW   = 10000000
 
-DEFAULT_BW = 10000000
-
-MAX_PATHS = 2
+MAX_PATHS = 10
 
 class ProjectController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -43,34 +44,30 @@ class ProjectController(app_manager.RyuApp):
         self.hosts = {}
         self.multipath_group_ids = {}
         self.group_ids = []
-        self.adjacency = defaultdict(dict)
         self.bandwidths = defaultdict(lambda: defaultdict(lambda: DEFAULT_BW))
+        self.graph = nx.DiGraph()
 
     def get_paths(self, src, dst):
         '''
-        Get all paths from src to dst using DFS algorithm    
+        Get all paths from src to dst using DFS algorithm
         '''
         if src == dst:
             # host target is on the same switch
             return [[src]]
+
+        path_results = nx.all_simple_paths(self.graph, source=src, target=dst)
         paths = []
-        stack = [(src, [src])]
-        while stack:
-            (node, path) = stack.pop()
-            for next in set(self.adjacency[node].keys()) - set(path):
-                if next is dst:
-                    paths.append(path + [next])
-                else:
-                    stack.append((next, path + [next]))
-        print "Available paths from ", src, " to ", dst, " : ", paths
+        for path in path_results:
+            paths.append(path)
+
         return paths
 
     def get_link_cost(self, s1, s2):
         '''
         Get the link cost between two switches 
         '''
-        e1 = self.adjacency[s1][s2]
-        e2 = self.adjacency[s2][s1]
+        e1 = self.graph.edges.get((s1,s2))["port_no"]
+        e2 = self.graph.edges.get((s2,s1))["port_no"]
         bl = min(self.bandwidths[s1][e1], self.bandwidths[s2][e2])
         ew = REFERENCE_BW/bl
         return ew
@@ -91,7 +88,12 @@ class ProjectController(app_manager.RyuApp):
         paths = self.get_paths(src, dst)
         paths_count = len(paths) if len(
             paths) < MAX_PATHS else MAX_PATHS
-        return sorted(paths, key=lambda x: self.get_path_cost(x))[0:(paths_count)]
+
+        sorted_paths = sorted(paths, key=lambda x: self.get_path_cost(x))[0:(paths_count)]
+
+        print("Available and selected paths from ", src, " to ", dst, " : ", sorted_paths)
+
+        return sorted_paths
 
     def add_ports_to_paths(self, paths, first_port, last_port):
         '''
@@ -102,9 +104,9 @@ class ProjectController(app_manager.RyuApp):
             p = {}
             in_port = first_port
             for s1, s2 in zip(path[:-1], path[1:]):
-                out_port = self.adjacency[s1][s2]
+                out_port = self.graph.edges.get((s1, s2))["port_no"]
                 p[s1] = (in_port, out_port)
-                in_port = self.adjacency[s2][s1]
+                in_port = self.graph.edges.get((s2, s1))["port_no"]
             p[path[-1]] = (in_port, last_port)
             paths_p.append(p)
         return paths_p
@@ -125,7 +127,7 @@ class ProjectController(app_manager.RyuApp):
         pw = []
         for path in paths:
             pw.append(self.get_path_cost(path))
-            print path, "cost = ", pw[len(pw) - 1]
+            print(path, "cost = ", pw[len(pw) - 1])
         sum_of_pw = sum(pw) * 1.0
         paths_with_ports = self.add_ports_to_paths(paths, first_port, last_port)
         switches_in_paths = set().union(*paths)
@@ -210,7 +212,7 @@ class ProjectController(app_manager.RyuApp):
 
                     self.add_flow(dp, 32768, match_ip, actions)
                     self.add_flow(dp, 1, match_arp, actions)
-        print "Path installation finished in ", time.time() - computation_start 
+        print("Path installation finished in ", time.time() - computation_start)
         return paths_with_ports[0][src][1]
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
@@ -231,15 +233,23 @@ class ProjectController(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def _switch_features_handler(self, ev):
-        print "switch_features_handler is called"
+        print("switch_features_handler is called")
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER,
-                                          ofproto.OFPCML_NO_BUFFER)]
+        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
+
+        ofp_parser = datapath.ofproto_parser
+
+        actions = []
+        match1 = ofp_parser.OFPMatch(eth_type=0x86DD) #IPv6
+        self.add_flow(datapath, 999, match1, actions)
+
+        match2 = ofp_parser.OFPMatch(eth_type=0x88CC) # LLDP
+        self.add_flow(datapath, 999, match2, actions)
 
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_stats_reply_handler(self, ev):
@@ -261,7 +271,11 @@ class ProjectController(app_manager.RyuApp):
 
         # avoid broadcast from LLDP
         if eth.ethertype == 35020:
-            return
+            match = parser.OFPMatch(eth_type=35020)
+            actions = []
+            self.add_flow(datapath, 1, match, actions)
+            return None
+
 
         if pkt.get_protocol(ipv6.ipv6):  # Drop the IPV6 Packets.
             match = parser.OFPMatch(eth_type=eth.ethertype)
@@ -318,34 +332,32 @@ class ProjectController(app_manager.RyuApp):
         if switch.id not in self.switches:
             self.switches.append(switch.id)
             self.datapath_list[switch.id] = switch
-
+            self.graph.add_node(switch.id, dp = switch)
             # Request port/link descriptions, useful for obtaining bandwidth
             req = ofp_parser.OFPPortDescStatsRequest(switch)
             switch.send_msg(req)
 
     @set_ev_cls(event.EventSwitchLeave, MAIN_DISPATCHER)
     def switch_leave_handler(self, ev):
-        print ev
+        print(ev)
         switch = ev.switch.dp.id
         if switch in self.switches:
             self.switches.remove(switch)
-            del self.datapath_list[switch]
-            del self.adjacency[switch]
+            if switch.id in self.graph.nodes:
+                self.graph.remove_node(switch.id)
 
     @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
     def link_add_handler(self, ev):
         s1 = ev.link.src
         s2 = ev.link.dst
-        self.adjacency[s1.dpid][s2.dpid] = s1.port_no
-        self.adjacency[s2.dpid][s1.dpid] = s2.port_no
+        self.graph.add_edge(s1.dpid, s2.dpid, port_no=s1.port_no)
+        self.graph.add_edge(s2.dpid, s1.dpid, port_no=s2.port_no)
 
     @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
     def link_delete_handler(self, ev):
         s1 = ev.link.src
         s2 = ev.link.dst
-        # Exception handling if switch already deleted
-        try:
-            del self.adjacency[s1.dpid][s2.dpid]
-            del self.adjacency[s2.dpid][s1.dpid]
-        except KeyError:
-            pass
+        if (s1.dpid, s2.dpid) in self.graph.edges:
+            self.graph.remove_edge(s1.dpid, s2.dpid)
+        if (s2.dpid, s1.dpid) in self.graph.edges:
+            self.graph.remove_edge(s2.dpid, s1.dpid)
