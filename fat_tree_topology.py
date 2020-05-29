@@ -3,7 +3,7 @@ from mininet.topo import Topo
 import logging
 import os
 
-logging.basicConfig(filename='./fattree.log', level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 

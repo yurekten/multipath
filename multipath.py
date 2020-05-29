@@ -26,7 +26,7 @@ import random
 import time
 import logging
 
-logging.basicConfig(filename='./fattree.log', level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 
@@ -47,6 +47,7 @@ class MultipathControllerApp(app_manager.RyuApp):
         self.arp_table = {}
         self.hosts = {}
         self.multipath_group_ids = {}
+        self.switch_groups = {}
         self.group_ids = []
         self.graph = nx.DiGraph()
         self.optimal_paths = defaultdict()
@@ -199,45 +200,64 @@ class MultipathControllerApp(app_manager.RyuApp):
                 out_ports = ports[in_port]
                 # print out_ports 
 
+                optimized_ports = defaultdict()
+                for port, weight in out_ports:
+                    if not port in optimized_ports:
+                        optimized_ports[port] = 0
+                    optimized_ports[port] = optimized_ports[port] + weight
+
+                new_group_ports = []
+                for port in optimized_ports:
+                    new_group_ports.append((port, optimized_ports[port]))
+                out_ports = new_group_ports
+                out_ports = sorted(out_ports, key=lambda tup: (tup[0], tup[1]))
+
+                out_ports_str = ' '.join([str(elem) for elem in out_ports])
+
                 if len(out_ports) > 1:
-                    group_new = False
 
-                    if (node, src, dst) not in self.multipath_group_ids:
-                        group_new = True
-                        self.multipath_group_ids[
-                            node, src, dst] = self.generate_openflow_gid()
-                    group_id = self.multipath_group_ids[node, src, dst]
-
-                    buckets = []
-                    # print "node at ",node," out ports : ",out_ports
-                    weight_k_factor = 0
-                    for _, weight in out_ports:
-                        weight_k_factor = weight_k_factor + 1.0 / weight
-
-                    weight_k = sum_of_pw / weight_k_factor
-                    for port, weight in out_ports:
-                        bucket_weight = int(round((1.0*weight_k/weight)*100/sum_of_pw))
-                        bucket_action = [ofp_parser.OFPActionOutput(port)]
-                        buckets.append(
-                            ofp_parser.OFPBucket(
-                                weight=bucket_weight,
-                                watch_port=port,
-                                watch_group=ofp.OFPG_ANY,
-                                actions=bucket_action
-                            )
-                        )
-
-                    if group_new:
-                        req = ofp_parser.OFPGroupMod(
-                            dp, ofp.OFPGC_ADD, ofp.OFPGT_SELECT, group_id,
-                            buckets
-                        )
-                        dp.send_msg(req)
+                    if node in self.switch_groups and out_ports_str in self.switch_groups[node]:
+                        group_id = self.switch_groups[node][out_ports_str]
                     else:
-                        req = ofp_parser.OFPGroupMod(
-                            dp, ofp.OFPGC_MODIFY, ofp.OFPGT_SELECT,
-                            group_id, buckets)
-                        dp.send_msg(req)
+                        group_new = False
+                        if (node, src, first_port, dst, last_port) not in self.multipath_group_ids:
+                            group_new = True
+                            self.multipath_group_ids[node, src, first_port, dst, last_port] = self.generate_openflow_gid()
+                        group_id = self.multipath_group_ids[node, src, first_port, dst, last_port]
+                        if not node in  self.switch_groups:
+                            self.switch_groups[node] = {}
+                        self.switch_groups[node][out_ports_str] = group_id
+
+                        buckets = []
+                        # print "node at ",node," out ports : ",out_ports
+                        weight_k_factor = 0
+                        for _, weight in out_ports:
+                            weight_k_factor = weight_k_factor + 1.0 / weight
+
+                        weight_k = sum_of_pw / weight_k_factor
+                        for port, weight in out_ports:
+                            bucket_weight = int(round((1.0*weight_k/weight)*100/sum_of_pw))
+                            bucket_action = [ofp_parser.OFPActionOutput(port)]
+                            buckets.append(
+                                ofp_parser.OFPBucket(
+                                    weight=bucket_weight,
+                                    watch_port=port,
+                                    watch_group=ofp.OFPG_ANY,
+                                    actions=bucket_action
+                                )
+                            )
+
+                        if group_new:
+                            req = ofp_parser.OFPGroupMod(
+                                dp, ofp.OFPGC_ADD, ofp.OFPGT_SELECT, group_id,
+                                buckets
+                            )
+                            dp.send_msg(req)
+                        else:
+                            req = ofp_parser.OFPGroupMod(
+                                dp, ofp.OFPGC_MODIFY, ofp.OFPGT_SELECT,
+                                group_id, buckets)
+                            dp.send_msg(req)
 
                     actions = [ofp_parser.OFPActionGroup(group_id)]
 
@@ -287,11 +307,6 @@ class MultipathControllerApp(app_manager.RyuApp):
 
         match2 = ofp_parser.OFPMatch(eth_type=0x88CC)  # LLDP
         self.add_flow(datapath, 999, match2, actions)
-
-    @set_ev_cls(ofp_event.EventOFPTableFeaturesStatsReply, MAIN_DISPATCHER)
-    def table_desc_reply_handler(self, ev):
-        switch = ev.msg.datapath
-
     @set_ev_cls(ofp_event.EventOFPGroupFeaturesStatsReply, MAIN_DISPATCHER)
     def group_desc_reply_handler(self, ev):
         switch = ev.msg.datapath
