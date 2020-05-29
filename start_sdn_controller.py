@@ -4,7 +4,7 @@
 import sys, os
 
 from ryu.cmd import manager
-
+from ryu.base.app_manager import AppManager
 
 def main():
 
@@ -14,7 +14,7 @@ def main():
     sys.argv.append('--enable-debugger')
     sys.argv.append('--observe-links')
     #sys.argv.append('ryu.app.ofctl_rest')
-    sys.argv.append('ryu_multipath')
+    sys.argv.append('multipath')
 
     #sys.argv.append('da.arp_handler')
     #sys.argv.append('da.simple_switch_snort')
@@ -25,4 +25,10 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt as err:
+        print("closing kindly")
+    finally:
+        app_mgr = AppManager.get_instance()
+        app_mgr.close()

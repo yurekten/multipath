@@ -24,9 +24,9 @@ class FatTree(Topo):
         self.density = int(k / 2)
         self.iHost = self.iEdgeLayerSwitch * self.density
 
-        self.bw_c2a = 0.2
-        self.bw_a2e = 0.1
-        self.bw_h2a = 0.05
+        self.bw_c2a = 20000
+        self.bw_a2e = 9000
+        self.bw_h2a = 80
 
         # Init Topo
         Topo.__init__(self)
@@ -85,7 +85,7 @@ class FatTree(Topo):
     Add Link
     """
 
-    def createLink(self, bw_c2a=0.2, bw_a2e=0.1, bw_h2a=0.5):
+    def createLink(self, bw_c2a=10000, bw_a2e=1000, bw_h2a=100):
         logger.debug("Add link Core to Agg.")
         end = int(self.pod / 2)
         for x in range(0, self.iAggLayerSwitch, end):
