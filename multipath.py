@@ -26,7 +26,7 @@ import random
 import time
 import logging
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -102,8 +102,7 @@ class MultipathControllerApp(app_manager.RyuApp):
 
         sorted_paths = sorted(paths, key=lambda x: self.get_path_cost(x))[0:(paths_count)]
         self.optimal_paths[(src, dst)] = sorted_paths
-        #print("Available and selected paths from ", src, " to ", dst, " : ", sorted_paths)
-
+         #logger.debug ("Available and selected paths from ", src, " to ", dst, " : ", sorted_paths)
         return sorted_paths
 
     def add_ports_to_paths(self, paths, first_port, last_port):
@@ -141,12 +140,12 @@ class MultipathControllerApp(app_manager.RyuApp):
         pw = []
         for path in paths:
             pw.append(self.get_path_cost(path))
-            #print(path, "cost = ", pw[len(pw) - 1])
+
         sum_of_pw = sum(pw) * 1.0
         paths_with_ports = self.add_ports_to_paths(paths, first_port, last_port)
         self.installed_paths[(src, first_port, dst, last_port, ip_src, ip_dst)] = paths_with_ports
-        #print("Paths from ", src, " to ", dst, " : ", paths_with_ports)
-        #print("Paths from ", src, " to ", dst)
+
+        #logger.debug("Paths from ", src, " to ", dst, " : ", paths_with_ports)
         switches_in_paths = set().union(*paths)
 
         for node in switches_in_paths:
@@ -156,7 +155,6 @@ class MultipathControllerApp(app_manager.RyuApp):
             ofp_parser = dp.ofproto_parser
 
             ports = defaultdict(list)
-            actions = []
             i = 0
 
             for path in paths_with_ports:
@@ -166,23 +164,6 @@ class MultipathControllerApp(app_manager.RyuApp):
                     if (out_port, pw[i]) not in ports[in_port]:
                         ports[in_port].append((out_port, pw[i]))
                 i += 1
-
-
-            # ports_pw = defaultdict()
-            # #ports_pw[in_port] = defaultdict()
-            # for path in paths_with_ports:
-            #     if node in path:
-            #         in_port = path[node][0]
-            #         out_port = path[node][1]
-            #         if out_port not in ports_pw:
-            #             #ports_pw[in_port] = {}
-            #             ports_pw[out_port] = pw[i]
-            #         else:
-            #             ports_pw[out_port] = pw[i] + ports_pw[out_port]
-            #     i += 1
-            #
-            # for out_port in ports_pw:
-            #     ports[in_port].append ((out_port, ports_pw[out_port],))
 
             for in_port in ports:
 
@@ -229,7 +210,6 @@ class MultipathControllerApp(app_manager.RyuApp):
                         self.switch_groups[node][out_ports_str] = group_id
 
                         buckets = []
-                        # print "node at ",node," out ports : ",out_ports
                         weight_k_factor = 0
                         for _, weight in out_ports:
                             weight_k_factor = weight_k_factor + 1.0 / weight
@@ -269,7 +249,7 @@ class MultipathControllerApp(app_manager.RyuApp):
 
                     self.add_flow(dp, 32768, match_ip, actions)
                     self.add_flow(dp, 1, match_arp, actions)
-        #print("Path installation is finished for src:%s port:%s > dst:%s port:%s src_ip:%s dst_ip:%s in %s sec" %(src, first_port, dst,  last_port, ip_src, ip_dst, time.time() - computation_start))
+        #logger.debug("Path installation is finished for src:%s port:%s > dst:%s port:%s src_ip:%s dst_ip:%s in %s sec" %(src, first_port, dst,  last_port, ip_src, ip_dst, time.time() - computation_start))
         return paths_with_ports[0][src][1]
 
     @staticmethod
@@ -410,12 +390,6 @@ class MultipathControllerApp(app_manager.RyuApp):
             # Request port/link descriptions, useful for obtaining bandwidth
             req = ofp_parser.OFPPortDescStatsRequest(switch)
             switch.send_msg(req)
-
-            #req = ofp_parser.OFPGroupFeaturesStatsRequest(switch)
-            #switch.send_msg(req)
-
-            #req = ofp_parser.OFPTableFeaturesStatsRequest(switch)
-            #switch.send_msg(req)
 
     @set_ev_cls(event.EventSwitchLeave, MAIN_DISPATCHER)
     def switch_leave_handler(self, ev):
