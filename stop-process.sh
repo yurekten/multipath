@@ -1,7 +1,7 @@
 #!/bin/bash
 
 process_name="start_sdn_controller"
-process_list=`ps -ef | grep $process_name | awk {'print $2'} | sed '$d'`
+process_list=`ps -ef | grep $process_name | awk {'print $2'} `
 
 if [[ -n $process_list ]]
 then
