@@ -112,9 +112,8 @@ class FatTree(Topo):
                 linkopts = dict(bw=bw_h2a)
                 self.addLink(
                     self.EdgeSwitchList[x],
-                    self.HostList[ int(self.density * x + i)],
+                    self.HostList[int(self.density * x + i)],
                     **linkopts)
-
 
 
 from mininet.net import Containernet
@@ -132,7 +131,7 @@ CONTROLLER_IP = "127.0.0.1"
 CONTROLLER_PORT = 6653
 OPENFLOW_PROTOCOL = 'OpenFlow15'
 IP_BASE = "10.0.88.0/24"
-#DPID_BASE = 0x1000
+# DPID_BASE = 0x1000
 DPID_BASE = 1000
 
 if __name__ == '__main__':

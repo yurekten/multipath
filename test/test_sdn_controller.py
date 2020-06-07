@@ -59,7 +59,8 @@ class TestSDNControllerApp(app_manager.RyuApp):
                                     instructions=inst, hard_timeout=hard_timeout, flags=flags, table_id=table)
         else:
             mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                    match=match, instructions=inst, hard_timeout=hard_timeout, flags=flags, table_id=table)
+                                    match=match, instructions=inst, hard_timeout=hard_timeout, flags=flags,
+                                    table_id=table)
         datapath.send_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
@@ -83,31 +84,31 @@ class TestSDNControllerApp(app_manager.RyuApp):
         self.add_flow(datapath, 999, match, actions_x, table=0)
 
         actions = [parser.NXActionOutputReg(ofs_nbits=nicira_ext.ofs_nbits(0, 31), src="reg0", max_len=2048)]
-        learn_action =  parser.NXActionLearn(
-                table_id=15,
-                specs=[
-                    # Match
-                    parser.NXFlowSpecMatch(
-                        src=('eth_type_nxm', 16),
-                        dst=('eth_type', 0),
-                        n_bits=16,
-                    ),
-                    parser.NXFlowSpecMatch(
-                        src=("ip_proto_nxm", 8),
-                        dst=('ip_proto', 0),
-                        n_bits=8,
-                    ),
+        learn_action = parser.NXActionLearn(
+            table_id=15,
+            specs=[
+                # Match
+                parser.NXFlowSpecMatch(
+                    src=('eth_type_nxm', 16),
+                    dst=('eth_type', 0),
+                    n_bits=16,
+                ),
+                parser.NXFlowSpecMatch(
+                    src=("ip_proto_nxm", 8),
+                    dst=('ip_proto', 0),
+                    n_bits=8,
+                ),
 
-                    # Actions
-                    parser.NXFlowSpecLoad(
-                        src=('reg6', 0),
-                        dst=('reg7', 0),
-                        n_bits=32,
-                    ),
-                ],
-                fin_idle_timeout=1,
-                fin_hard_timeout=1,
-            )
+                # Actions
+                parser.NXFlowSpecLoad(
+                    src=('reg6', 0),
+                    dst=('reg7', 0),
+                    n_bits=32,
+                ),
+            ],
+            fin_idle_timeout=1,
+            fin_hard_timeout=1,
+        )
 
         actions.append(learn_action)
         self.add_flow(datapath, 999, match, actions, table=10)
