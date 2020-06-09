@@ -30,7 +30,7 @@ import random
 import time
 import logging
 
-from flow_multipath import FlowMultipathManager
+from multipath_manager import FlowMultipathManager
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -109,26 +109,24 @@ class MultipathControllerApp(app_manager.RyuApp):
 
 
     def install_paths(self, src, first_port, dst, last_port, ip_src, ip_dst):
-
+        first_time = False
         if not (src, first_port, dst, last_port, ip_src, ip_dst) in self.flow_managers:
+            start = time.perf_counter()
+            first_time = False
             dp_list = self.datapath_list
             graph = self.graph
             flow_manager = FlowMultipathManager(self, graph, dp_list, src, first_port, dst, last_port, ip_src, ip_dst)
             self.flow_managers[(src, first_port, dst, last_port, ip_src, ip_dst)] = flow_manager
 
+            end = time.perf_counter()
+            logger.info(f"initiate flow {(src, first_port, dst, last_port, ip_src, ip_dst)} in {end - start:0.4f} seconds")
+
         flow_manager = self.flow_managers[(src, first_port, dst, last_port, ip_src, ip_dst)]
+        output_port = flow_manager.initiate_paths()
+        if first_time:
+            logger.info(f"flow {(src, first_port, dst, last_port, ip_src, ip_dst)} setup completed in {end - start:0.4f} seconds")
 
-        status = flow_manager.get_status()
-        if status == FlowMultipathManager.ACTIVE:
-            return flow_manager.initiate_paths()
-        elif status == FlowMultipathManager.INITIATED:
-            return flow_manager.initiate_paths()
-        elif status == FlowMultipathManager.NOT_ACTIVE:
-            return flow_manager.initiate_paths()
-        else:
-            assert status <=  FlowMultipathManager.NOT_ACTIVE, "Not defined state"
-            return None
-
+        return output_port
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None, hard_timeout=0, flags=0, cookie=0,
                  table_id=0, caller=None):
@@ -168,6 +166,14 @@ class MultipathControllerApp(app_manager.RyuApp):
 
         match = parser.OFPMatch()
 
+        mod = parser.OFPFlowMod(datapath=datapath,
+                                command=ofproto.OFPFC_DELETE,
+                                out_port=ofproto.OFPP_ANY,
+                                out_group=ofproto.OFPG_ANY,
+                                match=match)
+        datapath.send_msg(mod)
+
+
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions, flags=0)
 
@@ -196,8 +202,8 @@ class MultipathControllerApp(app_manager.RyuApp):
                             max_bw = prop.curr_speed
                         # curr value is feature of port. 2112 (dec) and 0x840 Copper and 10 Gb full-duplex rate support
                         # type 0: ethernet 1: optical 0xFFFF: experimenter
-                        logger.info("Port:%s type:%d state:%s - current features=0x%x, current speed:%s kbps" % (
-                            port.port_no, prop.type, port.state, prop.curr, prop.curr_speed,))
+                        #logger.info("Port:%s type:%d state:%s - current features=0x%x, current speed:%s kbps" % (
+                        #    port.port_no, prop.type, port.state, prop.curr, prop.curr_speed,))
                 port_bandwidths[port.port_no] = max_bw
             self.graph.nodes[switch.id]["port_desc_stats"] = sw_ports
             self.graph.nodes[switch.id]["port_bandwidths"] = port_bandwidths
@@ -244,14 +250,17 @@ class MultipathControllerApp(app_manager.RyuApp):
             dst_ip = ip_pkt.dst
             self.arp_table[src_ip] = src
             self.arp_table[dst_ip] = dst
-            if src in self.hosts and dst in self.hosts:
-                h1 = self.hosts[src]
-                h2 = self.hosts[dst]
-                if (dst_ip, src_ip) in self.broadcast_messages:
-                    self.broadcast_messages[(dst_ip, src_ip)]["ip"] = src_ip
+        else:
+            return
 
-                out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
-                self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)  # reverse
+        if src in self.hosts and dst in self.hosts:
+            h1 = self.hosts[src]
+            h2 = self.hosts[dst]
+            if (dst_ip, src_ip) in self.broadcast_messages:
+                self.broadcast_messages[(dst_ip, src_ip)]["ip"] = src_ip
+
+            out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
+            self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)  # reverse
 
 
         #if arp_pkt and (self.hosts[src][0] == datapath.id):
@@ -269,6 +278,7 @@ class MultipathControllerApp(app_manager.RyuApp):
                     self.broadcast_messages[(dst_ip, src_ip)]["ip"] = src_ip
 
                 out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
+
                 self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)  # reverse
             elif arp_pkt.opcode == arp.ARP_REQUEST:
                 if dst_ip in self.arp_table:
@@ -296,20 +306,21 @@ class MultipathControllerApp(app_manager.RyuApp):
                     # out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
                     # self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)  # reverse
 
-            actions = [parser.OFPActionOutput(out_port)]
+        actions = [parser.OFPActionOutput(out_port)]
 
-            data = None
-            if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-                data = msg.data
+        data = None
+        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+            data = msg.data
 
-            out = parser.OFPPacketOut(
-                datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
-                actions=actions, data=data)
-            try:
+        out = parser.OFPPacketOut(
+            datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
+            actions=actions, data=data)
+        try:
+            if out_port is not None:
                 datapath.send_msg(out)
-            except Exception as err:
-                print("out in_port: %s" % in_port)
-                raise err
+        except Exception as err:
+            print("out in_port: %s" % in_port)
+            raise err
 
             # h1 = self.hosts[src]
             # h2 = self.hosts[dst]

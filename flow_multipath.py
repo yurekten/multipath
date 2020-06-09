@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 REFERENCE_BW = 10000000
 
-class FlowMultipathManager(object):
+class FlowMultipathManagerX(object):
     NOT_ACTIVE = 0
     INITIATED = 1
     ACTIVE = 2
