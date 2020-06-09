@@ -64,6 +64,7 @@ class MultipathControllerApp(app_manager.RyuApp):
         self.sw_cookie = defaultdict()
         self.path_flows = defaultdict()
         self.flow_managers = defaultdict()
+        self.broadcast_messages = defaultdict()
 
 
     def get_next_flow_cookie(self, sw_id):
@@ -109,68 +110,25 @@ class MultipathControllerApp(app_manager.RyuApp):
 
     def install_paths(self, src, first_port, dst, last_port, ip_src, ip_dst):
 
-        if not  (src, first_port, dst, last_port, ip_src, ip_dst) in self.flow_managers:
-            flow_manager = FlowMultipathManager(self, self.graph, self.datapath_list, src, first_port, dst, last_port, ip_src, ip_dst)
+        if not (src, first_port, dst, last_port, ip_src, ip_dst) in self.flow_managers:
+            dp_list = self.datapath_list
+            graph = self.graph
+            flow_manager = FlowMultipathManager(self, graph, dp_list, src, first_port, dst, last_port, ip_src, ip_dst)
             self.flow_managers[(src, first_port, dst, last_port, ip_src, ip_dst)] = flow_manager
 
         flow_manager = self.flow_managers[(src, first_port, dst, last_port, ip_src, ip_dst)]
 
         status = flow_manager.get_status()
         if status == FlowMultipathManager.ACTIVE:
-            return flow_manager.get_output_port()
+            return flow_manager.initiate_paths()
         elif status == FlowMultipathManager.INITIATED:
-            return flow_manager.get_output_port()
+            return flow_manager.initiate_paths()
         elif status == FlowMultipathManager.NOT_ACTIVE:
             return flow_manager.initiate_paths()
         else:
             assert status <=  FlowMultipathManager.NOT_ACTIVE, "Not defined state"
+            return None
 
-    def deneme(self, src, first_port, dst, last_port, ip_src, ip_dst):
-        if (src, first_port, dst, last_port, ip_src, ip_dst) in self.installed_paths:
-            current_path = self.installed_paths[(src, first_port, dst, last_port, ip_src, ip_dst)]["paths_with_ports"]
-            return current_path[0][src][1]
-
-        computation_start = time.time()
-        paths = self.get_optimal_paths(src, dst)
-        pw = []
-        for path in paths:
-            pw.append(self.get_path_cost(path))
-
-        sum_of_pw = sum(pw) * 1.0
-        paths_with_ports = self.add_ports_to_paths(paths, first_port, last_port)
-        self.installed_paths[(src, first_port, dst, last_port, ip_src, ip_dst)] = defaultdict()
-        self.installed_paths[(src, first_port, dst, last_port, ip_src, ip_dst)]["paths_with_ports"] = paths_with_ports
-        first_path= random.randint(0, len(paths_with_ports)-1)
-        self.installed_paths[(src, first_port, dst, last_port, ip_src, ip_dst)]["installed_flows"] = [first_path]
-
-        self.path_flows[(src, first_port, dst, last_port, ip_src, ip_dst)] = []
-        for current_path in paths_with_ports:
-            flows = defaultdict()
-            self.path_flows[(src, first_port, dst, last_port, ip_src, ip_dst)].append(flows)
-            for node in current_path:
-                dp = self.datapath_list[node]
-                ofp = dp.ofproto
-                ofp_parser = dp.ofproto_parser
-                match_ip = ofp_parser.OFPMatch(
-                    eth_type=0x0800,
-                    ipv4_src=ip_src,
-                    ipv4_dst=ip_dst
-                )
-                match_arp = ofp_parser.OFPMatch(
-                    eth_type=0x0806,
-                    arp_spa=ip_src,
-                    arp_tpa=ip_dst
-                )
-                actions = [ofp_parser.OFPActionOutput(current_path[node][1])]
-                flows[node] = (dp, match_ip, match_arp, actions)
-                #installed_path = self.path_flows[(src, first_port, dst, last_port, ip_src, ip_dst)][first_path]
-
-        for node in self.path_flows[(src, first_port, dst, last_port, ip_src, ip_dst)][first_path]:
-            dp, match_ip, match_arp, actions = self.path_flows[(src, first_port, dst, last_port, ip_src, ip_dst)][first_path][node]
-            flow_id = self.add_flow(dp, 32768, match_ip, actions, hard_timeout=0)
-            flow_id = self.add_flow(dp, 32768, match_arp, actions, hard_timeout=0)
-
-        return paths_with_ports[first_path][src][1]
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None, hard_timeout=0, flags=0, cookie=0,
                  table_id=0, caller=None):
@@ -210,9 +168,6 @@ class MultipathControllerApp(app_manager.RyuApp):
 
         match = parser.OFPMatch()
 
-
-
-
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions, flags=0)
 
@@ -221,15 +176,6 @@ class MultipathControllerApp(app_manager.RyuApp):
         actions = []
         match1 = ofp_parser.OFPMatch(eth_type=0x86DD)  # IPv6
         self.add_flow(datapath, 999, match1, actions, flags=0)
-
-        mod = parser.OFPFlowMod(datapath=datapath, match=match, command=ofproto.OFPFC_DELETE)
-        datapath.send_msg(mod)
-        # match2 = ofp_parser.OFPMatch(eth_type=0x88CC)  # LLDP
-        # self.add_flow(datapath, 999, match2, actions)
-
-    @set_ev_cls(ofp_event.EventOFPGroupFeaturesStatsReply, MAIN_DISPATCHER)
-    def group_desc_reply_handler(self, ev):
-        switch = ev.msg.datapath
 
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_stats_reply_handler(self, ev):
@@ -262,23 +208,19 @@ class MultipathControllerApp(app_manager.RyuApp):
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
+        buffer_id = msg.buffer_id
         in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         arp_pkt = pkt.get_protocol(arp.arp)
+        ip_pkt = pkt.get_protocol(ipv4.ipv4)
 
         # avoid broadcast from LLDP
         if eth.ethertype == 0x88CC:
-            # match = parser.OFPMatch(eth_type=35020)
-            # actions = []
-            # self.add_flow(datapath, 1, match, actions)
             return None
 
-        if pkt.get_protocol(ipv6.ipv6):  # Drop the IPV6 Packets.
-            # match = parser.OFPMatch(eth_type=eth.ethertype)
-            # actions = []
-            # self.add_flow(datapath, 1, match, actions)
+        if pkt.get_protocol(ipv6.ipv6):
             return None
 
         dst = eth.dst
@@ -289,40 +231,94 @@ class MultipathControllerApp(app_manager.RyuApp):
             self.hosts[src] = (dpid, in_port)
 
         out_port = ofproto.OFPP_FLOOD
+        if arp_pkt:
+            src_ip = arp_pkt.src_ip
+            dst_ip = arp_pkt.dst_ip
+            if arp_pkt.opcode == arp.ARP_REPLY:
+                self.arp_table[src_ip] = src
+            elif arp_pkt.opcode == arp.ARP_REQUEST:
+                if dst_ip in self.arp_table:
+                    self.arp_table[src_ip] = src
+        elif ip_pkt:
+            src_ip = ip_pkt.src
+            dst_ip = ip_pkt.dst
+            self.arp_table[src_ip] = src
+            self.arp_table[dst_ip] = dst
+            if src in self.hosts and dst in self.hosts:
+                h1 = self.hosts[src]
+                h2 = self.hosts[dst]
+                if (dst_ip, src_ip) in self.broadcast_messages:
+                    self.broadcast_messages[(dst_ip, src_ip)]["ip"] = src_ip
+
+                out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
+                self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)  # reverse
+
+
+        #if arp_pkt and (self.hosts[src][0] == datapath.id):
 
         if arp_pkt:
             # print dpid, pkt
             src_ip = arp_pkt.src_ip
             dst_ip = arp_pkt.dst_ip
+
             if arp_pkt.opcode == arp.ARP_REPLY:
                 self.arp_table[src_ip] = src
                 h1 = self.hosts[src]
                 h2 = self.hosts[dst]
+                if (dst_ip, src_ip) in self.broadcast_messages:
+                    self.broadcast_messages[(dst_ip, src_ip)]["ip"] = src_ip
+
                 out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
                 self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)  # reverse
             elif arp_pkt.opcode == arp.ARP_REQUEST:
                 if dst_ip in self.arp_table:
                     self.arp_table[src_ip] = src
-                    dst_mac = self.arp_table[dst_ip]
-                    h1 = self.hosts[src]
-                    h2 = self.hosts[dst_mac]
-                    out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
-                    self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)  # reverse
 
-        actions = [parser.OFPActionOutput(out_port)]
+                if (src_ip, dst_ip) in self.broadcast_messages:
+                    if not datapath.id in self.broadcast_messages[(src_ip, dst_ip)]["dp_list"]:
+                        self.broadcast_messages[(src_ip, dst_ip)]["dp_list"].append(datapath.id)
+                    else:
+                        if self.broadcast_messages[(src_ip, dst_ip)]["ip"] is not None:
+                            return
 
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
+                        #first_time = self.broadcast_messages[(src_ip, dst_ip)]["time"]
+                        #if time.time() - first_time < 2:
+                        #    return None
+                else:
+                    self.broadcast_messages[(src_ip, dst_ip)] = defaultdict()
+                    self.broadcast_messages[(src_ip, dst_ip)]["time"] = time.time()
+                    self.broadcast_messages[(src_ip, dst_ip)]["dp_list"] = [datapath.id]
+                    self.broadcast_messages[(src_ip, dst_ip)]["ip"] = None
 
-        out = parser.OFPPacketOut(
-            datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
-            actions=actions, data=data)
-        try:
-            datapath.send_msg(out)
-        except Exception as err:
-            print("out in_port: %s" %in_port)
-            raise err
+                    # dst_mac = self.arp_table[dst_ip]
+                    # h1 = self.hosts[src]
+                    # h2 = self.hosts[dst_mac]
+                    # out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
+                    # self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)  # reverse
+
+            actions = [parser.OFPActionOutput(out_port)]
+
+            data = None
+            if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                data = msg.data
+
+            out = parser.OFPPacketOut(
+                datapath=datapath, buffer_id=msg.buffer_id, in_port=in_port,
+                actions=actions, data=data)
+            try:
+                datapath.send_msg(out)
+            except Exception as err:
+                print("out in_port: %s" % in_port)
+                raise err
+
+            # h1 = self.hosts[src]
+            # h2 = self.hosts[dst]
+            #
+            # src_ip = ip_pkt.ip_src
+            # dst_ip = ip_pkt.ip_dst
+            # out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
+
+
 
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
@@ -365,8 +361,10 @@ class MultipathControllerApp(app_manager.RyuApp):
         dp = msg.datapath
         ofp = dp.ofproto
 
-        manager = self.flows[dp.id][msg.cookie]
-        manager[1].flow_removed(msg)
+        if dp.id in self.flows:
+            if msg.cookie in self.flows[dp.id]:
+                manager = self.flows[dp.id][msg.cookie]
+                manager[1].flow_removed(msg)
         # for manager in self.flow_managers:
         #
         # if msg.reason == ofp.OFPRR_IDLE_TIMEOUT:
