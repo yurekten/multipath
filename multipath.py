@@ -67,7 +67,7 @@ class MultipathControllerApp(app_manager.RyuApp):
         self.broadcast_messages = defaultdict()
 
 
-    def get_next_flow_cookie(self, sw_id):
+    def _get_next_flow_cookie(self, sw_id):
         if not sw_id in self.sw_cookie:
             self.sw_cookie[sw_id] = defaultdict()
             self.sw_cookie[sw_id]["sw_cookie"] = self.unused_cookie
@@ -77,36 +77,6 @@ class MultipathControllerApp(app_manager.RyuApp):
         self.sw_cookie[sw_id]["last_flow_cookie"] = self.sw_cookie[sw_id]["last_flow_cookie"] + 1
 
         return self.sw_cookie[sw_id]["last_flow_cookie"]
-
-    def increment_flow_cookie(self, ):
-        self.base_cookie = self.base_cookie + 0x00100
-
-    def add_ports_to_paths(self, paths, first_port, last_port):
-        """
-        Add the ports that connects the switches for all paths
-        """
-        paths_p = []
-        for path in paths:
-            p = {}
-            in_port = first_port
-            for s1, s2 in zip(path[:-1], path[1:]):
-                out_port = self.graph.edges.get((s1, s2))["port_no"]
-                p[s1] = (in_port, out_port)
-                in_port = self.graph.edges.get((s2, s1))["port_no"]
-            p[path[-1]] = (in_port, last_port)
-            paths_p.append(p)
-        return paths_p
-
-    def generate_openflow_gid(self):
-        """
-        Returns a random OpenFlow group id
-        """
-        n = random.randint(0, 2 ** 32)
-        while n in self.group_ids:
-            n = random.randint(0, 2 ** 32)
-        return n
-
-
 
     def install_paths(self, src, first_port, dst, last_port, ip_src, ip_dst):
         first_time = False
@@ -132,11 +102,10 @@ class MultipathControllerApp(app_manager.RyuApp):
                  table_id=0, caller=None):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        # if flags is None:
-        #    flags = ofproto.OFPFF_SEND_FLOW_REM
+
         flow_id = cookie
         if cookie == 0:
-            flow_id = self.get_next_flow_cookie(datapath.id)
+            flow_id = self._get_next_flow_cookie(datapath.id)
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         if buffer_id:
@@ -149,7 +118,7 @@ class MultipathControllerApp(app_manager.RyuApp):
                                     match=match, instructions=inst, hard_timeout=hard_timeout, flags=flags,
                                     cookie=flow_id, table_id=table_id)
         datapath.send_msg(mod)
-        if not datapath.id in self.flows:
+        if datapath.id not in self.flows:
             self.flows[datapath.id] = defaultdict()
         if caller:
             self.flows[datapath.id][flow_id] = (mod, caller)
@@ -172,7 +141,6 @@ class MultipathControllerApp(app_manager.RyuApp):
                                 out_group=ofproto.OFPG_ANY,
                                 match=match)
         datapath.send_msg(mod)
-
 
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions, flags=0)
@@ -203,7 +171,7 @@ class MultipathControllerApp(app_manager.RyuApp):
                         # curr value is feature of port. 2112 (dec) and 0x840 Copper and 10 Gb full-duplex rate support
                         # type 0: ethernet 1: optical 0xFFFF: experimenter
                         #logger.info("Port:%s type:%d state:%s - current features=0x%x, current speed:%s kbps" % (
-                        #    port.port_no, prop.type, port.state, prop.curr, prop.curr_speed,))
+                        #port.port_no, prop.type, port.state, prop.curr, prop.curr_speed,))
                 port_bandwidths[port.port_no] = max_bw
             self.graph.nodes[switch.id]["port_desc_stats"] = sw_ports
             self.graph.nodes[switch.id]["port_bandwidths"] = port_bandwidths
@@ -214,7 +182,6 @@ class MultipathControllerApp(app_manager.RyuApp):
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        buffer_id = msg.buffer_id
         in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
@@ -290,21 +257,11 @@ class MultipathControllerApp(app_manager.RyuApp):
                     else:
                         if self.broadcast_messages[(src_ip, dst_ip)]["ip"] is not None:
                             return
-
-                        #first_time = self.broadcast_messages[(src_ip, dst_ip)]["time"]
-                        #if time.time() - first_time < 2:
-                        #    return None
                 else:
                     self.broadcast_messages[(src_ip, dst_ip)] = defaultdict()
                     self.broadcast_messages[(src_ip, dst_ip)]["time"] = time.time()
                     self.broadcast_messages[(src_ip, dst_ip)]["dp_list"] = [datapath.id]
                     self.broadcast_messages[(src_ip, dst_ip)]["ip"] = None
-
-                    # dst_mac = self.arp_table[dst_ip]
-                    # h1 = self.hosts[src]
-                    # h2 = self.hosts[dst_mac]
-                    # out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
-                    # self.install_paths(h2[0], h2[1], h1[0], h1[1], dst_ip, src_ip)  # reverse
 
         actions = [parser.OFPActionOutput(out_port)]
 
@@ -321,15 +278,6 @@ class MultipathControllerApp(app_manager.RyuApp):
         except Exception as err:
             print("out in_port: %s" % in_port)
             raise err
-
-            # h1 = self.hosts[src]
-            # h2 = self.hosts[dst]
-            #
-            # src_ip = ip_pkt.ip_src
-            # dst_ip = ip_pkt.ip_dst
-            # out_port = self.install_paths(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip)
-
-
 
     @set_ev_cls(event.EventSwitchEnter)
     def switch_enter_handler(self, ev):
@@ -370,26 +318,8 @@ class MultipathControllerApp(app_manager.RyuApp):
     def flow_removed_handler(self, ev):
         msg = ev.msg
         dp = msg.datapath
-        ofp = dp.ofproto
 
         if dp.id in self.flows:
             if msg.cookie in self.flows[dp.id]:
                 manager = self.flows[dp.id][msg.cookie]
                 manager[1].flow_removed(msg)
-        # for manager in self.flow_managers:
-        #
-        # if msg.reason == ofp.OFPRR_IDLE_TIMEOUT:
-        #     reason = 'IDLE TIMEOUT'
-        # elif msg.reason == ofp.OFPRR_HARD_TIMEOUT:
-        #     reason = 'HARD TIMEOUT'
-        # elif msg.reason == ofp.OFPRR_DELETE:
-        #     reason = 'DELETE'
-        # elif msg.reason == ofp.OFPRR_GROUP_DELETE:
-        #     reason = 'GROUP DELETE'
-        # else:
-        #     reason = 'unknown'
-        #
-        # print(
-        #     'OFPFlowRemoved received: cookie=%d priority=%d reason=%s table_id=%d duration_sec=%d duration_nsec=%d idle_timeout=%d hard_timeout=%d packet_count=%d byte_count=%d match.fields=%s' % (
-        #     msg.cookie, msg.priority, reason, msg.table_id, msg.duration_sec, msg.duration_nsec, msg.idle_timeout,
-        #     msg.hard_timeout, msg.packet_count, msg.byte_count, msg.match))
