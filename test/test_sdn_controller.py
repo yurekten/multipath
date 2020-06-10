@@ -45,7 +45,7 @@ class TestSDNControllerApp(app_manager.RyuApp):
         super(TestSDNControllerApp, self).__init__(*args, **kwargs)
 
     @staticmethod
-    def add_flow(datapath, priority, match, actions, buffer_id=None, hard_timeout=0, flags=0, table=0):
+    def add_flow(datapath, priority, match, actions, buffer_id=None, hard_timeout=0, flags=0, table=0, idle_timeout=0):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         if flags == 0:
@@ -55,10 +55,10 @@ class TestSDNControllerApp(app_manager.RyuApp):
                                              actions)]
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match,
+                                    priority=priority, match=match, idle_timeout=idle_timeout,
                                     instructions=inst, hard_timeout=hard_timeout, flags=flags, table_id=table)
         else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+            mod = parser.OFPFlowMod(datapath=datapath, priority=priority, idle_timeout=idle_timeout,
                                     match=match, instructions=inst, hard_timeout=hard_timeout, flags=flags,
                                     table_id=table)
         datapath.send_msg(mod)

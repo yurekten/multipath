@@ -32,8 +32,8 @@ import logging
 
 from multipath_manager import FlowMultipathManager
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.setLevel(level=logging.WARNING)
 
 # Cisco Reference bandwidth = 1 Gbps
 REFERENCE_BW = 10000000
@@ -47,23 +47,17 @@ class MultipathControllerApp(app_manager.RyuApp):
 
     def __init__(self, *args, **kwargs):
         super(MultipathControllerApp, self).__init__(*args, **kwargs)
-        self.mac_to_port = {}
-        self.topology_api_app = self
+
+        self.sw_cookie = defaultdict()
+        self.unused_cookie = 0x0010000
+        self.flow_managers = defaultdict()
         self.datapath_list = {}
+
+        self.flows = defaultdict()
+        self.topology = nx.DiGraph()
+
         self.arp_table = {}
         self.hosts = {}
-        self.multipath_group_ids = {}
-        self.switch_groups = {}
-        self.group_ids = []
-        self.graph = nx.DiGraph()
-        self.optimal_paths = defaultdict()
-        self.installed_paths = defaultdict()
-        self.flows = defaultdict()
-        self.flow_counter = random.randint(0, 2 ** 10)
-        self.unused_cookie = 0x0010000
-        self.sw_cookie = defaultdict()
-        self.path_flows = defaultdict()
-        self.flow_managers = defaultdict()
         self.broadcast_messages = defaultdict()
 
 
@@ -80,26 +74,26 @@ class MultipathControllerApp(app_manager.RyuApp):
 
     def install_paths(self, src, first_port, dst, last_port, ip_src, ip_dst):
         first_time = False
+        start = time.perf_counter()
         if not (src, first_port, dst, last_port, ip_src, ip_dst) in self.flow_managers:
-            start = time.perf_counter()
-            first_time = False
+            first_time = True
             dp_list = self.datapath_list
-            graph = self.graph
-            flow_manager = FlowMultipathManager(self, graph, dp_list, src, first_port, dst, last_port, ip_src, ip_dst)
+            flow_manager = FlowMultipathManager(self, self.topology, dp_list, src, first_port, dst, last_port, ip_src, ip_dst)
             self.flow_managers[(src, first_port, dst, last_port, ip_src, ip_dst)] = flow_manager
-
-            end = time.perf_counter()
-            logger.info(f"initiate flow {(src, first_port, dst, last_port, ip_src, ip_dst)} in {end - start:0.4f} seconds")
+            if logger.isEnabledFor(level=logging.INFO):
+                end = time.perf_counter()
+                logger.info(f"initiate flow {(src, first_port, dst, last_port, ip_src, ip_dst)} in {end - start:0.4f} seconds")
 
         flow_manager = self.flow_managers[(src, first_port, dst, last_port, ip_src, ip_dst)]
         output_port = flow_manager.initiate_paths()
-        if first_time:
-            logger.info(f"flow {(src, first_port, dst, last_port, ip_src, ip_dst)} setup completed in {end - start:0.4f} seconds")
+        if first_time and logger.isEnabledFor(level=logging.INFO):
+            setup_end = time.perf_counter()
+            logger.info(f"flow {(src, first_port, dst, last_port, ip_src, ip_dst)} setup completed in {setup_end - start:0.4f} seconds")
 
         return output_port
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None, hard_timeout=0, flags=0, cookie=0,
-                 table_id=0, caller=None):
+                 table_id=0, idle_timeout=0, caller=None):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
@@ -110,11 +104,11 @@ class MultipathControllerApp(app_manager.RyuApp):
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
         if buffer_id:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id,
-                                    priority=priority, match=match,
+                                    priority=priority, match=match, idle_timeout=idle_timeout,
                                     instructions=inst, hard_timeout=hard_timeout, flags=flags, cookie=flow_id,
                                     table_id=table_id)
         else:
-            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+            mod = parser.OFPFlowMod(datapath=datapath, priority=priority, idle_timeout=idle_timeout,
                                     match=match, instructions=inst, hard_timeout=hard_timeout, flags=flags,
                                     cookie=flow_id, table_id=table_id)
         datapath.send_msg(mod)
@@ -128,7 +122,7 @@ class MultipathControllerApp(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def _switch_features_handler(self, ev):
-        # logger.info("switch_features_handler is called for %s" % str(ev))
+        logger.debug("switch_features_handler is called for %s" % str(ev))
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
@@ -155,7 +149,7 @@ class MultipathControllerApp(app_manager.RyuApp):
     def port_desc_stats_reply_handler(self, ev):
         switch = ev.msg.datapath
         print("Port Description Stats for Switch %s" % switch.id)
-        if switch.id in self.graph.nodes:
+        if switch.id in self.topology.nodes:
 
             sw_ports = defaultdict()
             port_bandwidths = defaultdict()
@@ -168,13 +162,14 @@ class MultipathControllerApp(app_manager.RyuApp):
                         # select maximum speed
                         if max_bw < prop.curr_speed:
                             max_bw = prop.curr_speed
-                        # curr value is feature of port. 2112 (dec) and 0x840 Copper and 10 Gb full-duplex rate support
-                        # type 0: ethernet 1: optical 0xFFFF: experimenter
-                        #logger.info("Port:%s type:%d state:%s - current features=0x%x, current speed:%s kbps" % (
-                        #port.port_no, prop.type, port.state, prop.curr, prop.curr_speed,))
+                        if logger.isEnabledFor(level=logging.DEBUG):
+                            # curr value is feature of port. 2112 (dec) and 0x840 Copper and 10 Gb full-duplex rate support
+                            # type 0: ethernet 1: optical 0xFFFF: experimenter
+                            logger.debug("Port:%s type:%d state:%s - current features=0x%x, current speed:%s kbps"
+                                         % (port.port_no, prop.type, port.state, prop.curr, prop.curr_speed,))
                 port_bandwidths[port.port_no] = max_bw
-            self.graph.nodes[switch.id]["port_desc_stats"] = sw_ports
-            self.graph.nodes[switch.id]["port_bandwidths"] = port_bandwidths
+            self.topology.nodes[switch.id]["port_desc_stats"] = sw_ports
+            self.topology.nodes[switch.id]["port_bandwidths"] = port_bandwidths
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
@@ -280,42 +275,45 @@ class MultipathControllerApp(app_manager.RyuApp):
             raise err
 
     @set_ev_cls(event.EventSwitchEnter)
-    def switch_enter_handler(self, ev):
+    def _switch_enter_handler(self, ev):
+        if logger.isEnabledFor(level=logging.INFO):
+            logger.info(ev)
         switch = ev.switch.dp
         ofp_parser = switch.ofproto_parser
 
-        if switch.id not in self.graph.nodes:
+        if switch.id not in self.topology.nodes:
             self.datapath_list[switch.id] = switch
-            self.graph.add_node(switch.id, dp=switch)
+            self.topology.add_node(switch.id, dp=switch)
             # Request port/link descriptions, useful for obtaining bandwidth
             req = ofp_parser.OFPPortDescStatsRequest(switch)
             switch.send_msg(req)
 
     @set_ev_cls(event.EventSwitchLeave, MAIN_DISPATCHER)
-    def switch_leave_handler(self, ev):
-        logger.info(ev)
+    def _switch_leave_handler(self, ev):
+        if logger.isEnabledFor(level=logging.INFO):
+            logger.info(ev)
         switch_id = ev.switch.dp.id
-        if switch_id in self.graph.nodes:
-            self.graph.remove_node(switch_id)
+        if switch_id in self.topology.nodes:
+            self.topology.remove_node(switch_id)
 
     @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
-    def link_add_handler(self, ev):
+    def _link_add_handler(self, ev):
         s1 = ev.link.src
         s2 = ev.link.dst
-        self.graph.add_edge(s1.dpid, s2.dpid, port_no=s1.port_no)
-        self.graph.add_edge(s2.dpid, s1.dpid, port_no=s2.port_no)
+        self.topology.add_edge(s1.dpid, s2.dpid, port_no=s1.port_no)
+        self.topology.add_edge(s2.dpid, s1.dpid, port_no=s2.port_no)
 
     @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
     def link_delete_handler(self, ev):
         s1 = ev.link.src
         s2 = ev.link.dst
-        if (s1.dpid, s2.dpid) in self.graph.edges:
-            self.graph.remove_edge(s1.dpid, s2.dpid)
-        if (s2.dpid, s1.dpid) in self.graph.edges:
-            self.graph.remove_edge(s2.dpid, s1.dpid)
+        if (s1.dpid, s2.dpid) in self.topology.edges:
+            self.topology.remove_edge(s1.dpid, s2.dpid)
+        if (s2.dpid, s1.dpid) in self.topology.edges:
+            self.topology.remove_edge(s2.dpid, s1.dpid)
 
     @set_ev_cls(ofp_event.EventOFPFlowRemoved, MAIN_DISPATCHER)
-    def flow_removed_handler(self, ev):
+    def _flow_removed_handler(self, ev):
         msg = ev.msg
         dp = msg.datapath
 
