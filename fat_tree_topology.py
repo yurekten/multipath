@@ -7,24 +7,6 @@ import os
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-class OVSBridgeSTP( OVSSwitch ):
-    """Open vSwitch Ethernet bridge with Spanning Tree Protocol
-       rooted at the first bridge that is created"""
-    def __init__(self, name, failMode='secure', datapath='kernel',
-                 inband=False, protocols=None,
-                 reconnectms=1000, stp=False, batch=False, stp_priority=100,  **params):
-        super(OVSBridgeSTP, self).__init__(name, failMode, datapath,
-                 inband, protocols, reconnectms, stp, batch, **params)
-        self.stp_priority = stp_priority
-
-    def start( self, *args, **kwargs ):
-        super(OVSBridgeSTP, self).start(*args, **kwargs)
-        self.cmd( 'ovs-vsctl set-fail-mode', self, 'standalone' )
-        self.cmd( 'ovs-vsctl set-controller', self )
-        self.cmd( 'ovs-vsctl set Bridge', self,
-                  'stp_enable=true',
-                  'other_config:stp-priority=%d' % self.stp_priority )
-
 class FatTree(Topo):
     CoreSwitchList = []
     AggSwitchList = []

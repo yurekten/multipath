@@ -36,23 +36,23 @@ if __name__ == '__main__':
         # ----------switches-----------------------------
 
         dpid = dpid + 1
-        s1 = net.addSwitch('s1', dpid="%x" % (dpid))
+        s1 = net.addSwitch('s1', dpid="%x" % (dpid), failMode= "standalone", stp=True)
 
         dpid = dpid + 1
-        s2 = net.addSwitch('s2', dpid="%x" % (dpid))
+        s2 = net.addSwitch('s2', dpid="%x" % (dpid), failMode= "standalone", stp=True)
 
         new_link = net.addLink(s1, s2)
 
         dpid = dpid + 1
-        s3 = net.addSwitch('s3', dpid="%x" % (dpid))
+        s3 = net.addSwitch('s3', dpid="%x" % (dpid), failMode= "standalone", stp=True)
         new_link = net.addLink(s1, s3)
 
         dpid = dpid + 1
-        s4 = net.addSwitch('s4', dpid="%x" % (dpid))
+        s4 = net.addSwitch('s4', dpid="%x" % (dpid), failMode= "standalone", stp=True)
         new_link = net.addLink(s3, s4)
 
         dpid = dpid + 1
-        s5 = net.addSwitch('s5', dpid="%x" % (dpid))
+        s5 = net.addSwitch('s5', dpid="%x" % (dpid), failMode= "standalone", stp=True)
         new_link = net.addLink(s4, s5)
 
         new_link = net.addLink(s2, s5)
