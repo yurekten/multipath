@@ -23,9 +23,10 @@ class FlowMultipathManager(object):
     INITIATED = 1
     ACTIVE = 2
     DESTROYING = 3
+    DEAD = 4
 
     def __init__(self, multipath_app, graph, dp_list, src, first_port, dst, last_port, ip_src, ip_dst, max_paths=10,
-                 max_installed_path_count=2, min_timeout_time=2, lowest_priority=30000):
+                 max_installed_path_count=3, min_timeout_time=2, lowest_priority=30000):
         self.state = FlowMultipathManager.NOT_ACTIVE
         self.multipath_app = multipath_app
         self.topology = graph
@@ -55,7 +56,7 @@ class FlowMultipathManager(object):
         self.flow_id_rule_set = defaultdict()
 
         self.statistics = defaultdict()
-        self.lock = RLock()
+        #self.lock = RLock()
 
         ### new added
 
@@ -66,6 +67,7 @@ class FlowMultipathManager(object):
 
         self.active_path = None
         self.active_path_index = -1
+        #self.update_paths()
 
     def _set_state(self, state):
         self.state = state
@@ -73,12 +75,14 @@ class FlowMultipathManager(object):
             logger.info('state is now: %s for %s ' % (self.state, self.flow_info))
 
     def _monitor(self):
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(f'Monitoring thread has started at {datetime.now()}')
         completed = False
         while not completed:
             if self.state == FlowMultipathManager.DESTROYING:
                 self.delete_paths()
                 if self.active_queue.qsize() == 0:
-                    self._set_state(FlowMultipathManager.NOT_ACTIVE)
+                    self._set_state(FlowMultipathManager.DEAD)
                     # statistics
                     #now = datetime.now()
                     #file_name = "%04s-%02s-%02s_%02s-%02s-%02s.%02s.json" \
@@ -89,10 +93,10 @@ class FlowMultipathManager(object):
 
                     completed = True
             else:
-                self.initiate_paths()
+                self.update_paths()
                 self.delete_paths()
-            hub.sleep(self.min_timeout_time / 4)
 
+            hub.sleep(self.min_timeout_time / 4)
         if logger.isEnabledFor(logging.INFO):
             logger.info(f'Monitoring thread has exited at {datetime.now()}')
 
@@ -102,7 +106,6 @@ class FlowMultipathManager(object):
             return o.__str__()
 
     def _manage_flow_times(self):
-
         completed = False
         while not completed:
             if self.state == FlowMultipathManager.DESTROYING:
@@ -110,6 +113,7 @@ class FlowMultipathManager(object):
                 while not exit_loop:
                     try:
                         index, deleted_item, ruleset_id = self.active_queue.get_nowait()
+                        self.active_path = self.optimal_paths[self.path_choices[index + 1]]
                         self.delete_queue.put_nowait((index, deleted_item, ruleset_id))
                         if logger.isEnabledFor(logging.INFO):
                             logger.info('%s put index:%s item:%s into delete queue %s'
@@ -144,9 +148,9 @@ class FlowMultipathManager(object):
                                     break
                         hub.sleep(self.min_timeout_time)
                     except queue.Empty:
-                        hub.sleep(self.min_timeout_time / 2)
+                        hub.sleep(self.min_timeout_time / 4)
                 else:
-                    hub.sleep(self.min_timeout_time / 2)
+                    hub.sleep(self.min_timeout_time / 4)
 
                 if self.state == FlowMultipathManager.ACTIVE and self.inactive_queue.qsize() < 5:
                     for index in range(0, len(self.path_choices)):
@@ -273,10 +277,6 @@ class FlowMultipathManager(object):
             paths_p.append(p)
         return paths_p
 
-    def initiate_paths(self):
-        with self.lock:
-            return self.update_paths()
-
     def update_paths(self):
         if self.state == FlowMultipathManager.NOT_ACTIVE:
 
@@ -289,9 +289,6 @@ class FlowMultipathManager(object):
 
             self.statistics["idle_count"] = 0
 
-            #!!! kill if not completed
-            self.monitor_thread = hub.spawn(self._monitor)
-            self.time_manager_thread = hub.spawn(self._manage_flow_times)
             self._calculate_optimal_paths()
 
             self.active_path = None
@@ -320,6 +317,7 @@ class FlowMultipathManager(object):
             rule_set_id = self.create_flow_rules(selected_path, priority, idle_timeout=self.min_timeout_time*2)
             self.active_queue.put_nowait((queue_index, current_path_index, rule_set_id))
 
+            self._set_state(FlowMultipathManager.ACTIVE)
             logger.info(
                 f'Installer - {self.flow_info} Put index:{queue_index} item:{index} into active queue {datetime.now()}')
 
@@ -338,7 +336,21 @@ class FlowMultipathManager(object):
             first_output_port = self.active_path[self.src][1]
             return first_output_port
         else:
-            return 0xfffffffb
+            return None
+
+    def get_active_path_port_for(self, datapath_id):
+        if self.state == FlowMultipathManager.NOT_ACTIVE:
+            self.monitor_thread = hub.spawn(self._monitor)
+            self.time_manager_thread = hub.spawn(self._manage_flow_times)
+            return None
+
+        #assert self.active_path is not None
+        if self.active_path is not None and datapath_id in self.active_path:
+            first_output_port = self.active_path[datapath_id][1]
+            return first_output_port
+        else:
+            return None
+
 
     @staticmethod
     def delete_flow(datapath, cookie):
@@ -373,12 +385,13 @@ class FlowMultipathManager(object):
 
             for sw in sw_ordered:
                 dp = self.dp_list[sw]
-                for ip_flow in self.statistics["rule_set"][rule_set_id]["datapath_list"][sw]["ip_flow"]:
-                    self.delete_flow(dp, ip_flow)
-                    # logger.info('0x%x is delete request sent to %s switch' % (ip_flow, sw))
-                for arp_flow in self.statistics["rule_set"][rule_set_id]["datapath_list"][sw]["arp_flow"]:
-                    self.delete_flow(dp, arp_flow)
-                    # logger.info('0x%x is delete request sent to %s switch' % (arp_flow, sw))
+                if sw in self.statistics["rule_set"][rule_set_id]["datapath_list"]:
+                    for ip_flow in self.statistics["rule_set"][rule_set_id]["datapath_list"][sw]["ip_flow"]:
+                        self.delete_flow(dp, ip_flow)
+                        # logger.info('0x%x is delete request sent to %s switch' % (ip_flow, sw))
+                    for arp_flow in self.statistics["rule_set"][rule_set_id]["datapath_list"][sw]["arp_flow"]:
+                        self.delete_flow(dp, arp_flow)
+                        # logger.info('0x%x is delete request sent to %s switch' % (arp_flow, sw))
 
             try:
                 queue_index, index, rule_set_id = self.delete_queue.get(block=False)
@@ -504,7 +517,7 @@ class FlowMultipathManager(object):
                         max_arp_packet = self.statistics["rule_set"][self.rule_set_id]["max_arp_packet_count"]
                         if max_ip_packet <= 0 and max_arp_packet <= 0:
                             self.statistics["idle_count"] = self.statistics["idle_count"] + 1
-                            if self.statistics["idle_count"] > 0:
-                                self._set_state(FlowMultipathManager.DESTROYING)
+                            self._set_state(FlowMultipathManager.DESTROYING)
+                            self.multipath_app.flow_manager_is_destroying(self)
                         else:
                             self.statistics["idle_count"] = 0
