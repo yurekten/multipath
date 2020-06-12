@@ -252,25 +252,15 @@ class FlowMultipathManager(object):
             # host target is on the same switch
             return [([self.src], 1)]
 
-        path_results = nx.all_simple_paths(self.topology, source=self.src, target=self.dst, cutoff=10)
+        path_results = nx.all_simple_paths(self.topology, source=self.src, target=self.dst, cutoff=16)
 
         paths = []
         for path in path_results:
             paths.append(path)
 
-        path_copy = paths[:]
-        #select only subset paths, eliminate paths contains others
-        for x in paths:
-            superset = []
-            for y in path_copy:
-                if set(x) < set(y):
-                    superset.append(y)
-            for deleted_item in superset:
-                ind = path_copy.index(deleted_item)
-                del path_copy[ind]
-
+        selected_paths = self._select_paths(paths)
         self.all_paths = []
-        for path in path_copy:
+        for path in selected_paths:
             path_cost = self._get_path_cost(path)
             self.all_paths.append((path, path_cost))
 
@@ -279,6 +269,38 @@ class FlowMultipathManager(object):
             logger.debug(f"Path selection is completed for {self.flow_info} in {end - start:0.4f} seconds")
 
         return self.all_paths
+
+    def _select_paths(self, paths):
+        selected_paths = paths[:]
+        #select only subset paths, eliminate paths contains others
+        for x in paths:
+            superset = []
+            for y in selected_paths:
+                if set(x) < set(y):
+                    superset.append(y)
+            for deleted_item in superset:
+                ind = selected_paths.index(deleted_item)
+                del selected_paths[ind]
+
+        return selected_paths
+
+    def X_select_paths(self, paths):
+        selected_paths = paths[:]
+
+        threshold = 2
+
+        # select only subset paths, eliminate paths contains others
+        for x in paths:
+            delete_list = []
+            for y in selected_paths:
+                if len(set(x) - set(y)) < threshold:
+                    delete_list.append(y)
+
+            for deleted_item in delete_list:
+                ind = selected_paths.index(deleted_item)
+                del selected_paths[ind]
+
+        return selected_paths
 
     def _get_path_cost(self, path):
         """
