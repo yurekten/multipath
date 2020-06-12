@@ -10,15 +10,12 @@ from ryu.base.app_manager import AppManager
 def main():
     sys.argv.append('--ofp-tcp-listen-port')
     sys.argv.append('6653')
-    # sys.argv.append('--verbose')
     sys.argv.append('--enable-debugger')
     sys.argv.append('--observe-links')
-    # sys.argv.append('ryu.app.ofctl_rest')
     sys.argv.append('multipath')
-
-    # sys.argv.append('da.arp_handler')
-    # sys.argv.append('da.simple_switch_snort')
-    # sys.argv.append('flowmanager.flowmanager')
+    # sys.argv.append('ryu.app.rest_topology')
+    # sys.argv.append('ryu.app.ws_topology')
+    # sys.argv.append('ryu.app.ofctl_rest')
     # sys.argv.append('ryu.app.gui_topology.gui_topology')
 
     manager.main()

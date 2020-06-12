@@ -6,7 +6,7 @@ from ryu.controller import mac_to_port
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
-from ryu.ofproto import ofproto_v1_4
+from ryu.ofproto import ofproto_v1_4, ofproto_v1_3
 from ryu.lib.mac import haddr_to_bin
 from ryu.lib.packet import packet
 from ryu.lib.packet import arp
@@ -37,17 +37,6 @@ from multipath_manager import FlowMultipathManager
 logger = logging.getLogger(__name__)
 logger.setLevel(level=logging.INFO)
 
-# Cisco Reference bandwidth = 1 Gbps
-REFERENCE_BW = 10000000
-DEFAULT_BW = 10000000
-
-MAX_PATHS = 10
-
-ETHERNET = ethernet.ethernet.__name__
-ETHERNET_MULTICAST = "ff:ff:ff:ff:ff:ff"
-ARP = arp.arp.__name__
-ICMP = icmp.icmp.__name__
-IPV4 = ipv4.ipv4.__name__
 
 class MultipathControllerApp(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_4.OFP_VERSION]
@@ -68,71 +57,35 @@ class MultipathControllerApp(app_manager.RyuApp):
         self.broadcast_messages = defaultdict()
 
         self.mac_to_port = {}
-        self.ip_to_port = {}
-        self.unmanaged_flows = {}
-        self.managed_flows = {}
+        self.candidate_flows = {}
+
 
         self.activation_delay = 2 #start if flow is active 2 seconds
         self.flow_stats_sampling_period = 0.3
-        self.min_flow_stats_sample = 4
+        self.min_flow_stats_sample = 1
+
         self.min_packet_in_period = 3
 
         hub.spawn(self._monitor_initial_flows)
 
-    def _get_next_flow_cookie(self, sw_id):
-        if not sw_id in self.sw_cookie:
-            self.sw_cookie[sw_id] = defaultdict()
-            self.sw_cookie[sw_id]["sw_cookie"] = self.unused_cookie
-            self.sw_cookie[sw_id]["last_flow_cookie"] = self.unused_cookie
-            self.unused_cookie = self.unused_cookie + 0x0010000
-
-        self.sw_cookie[sw_id]["last_flow_cookie"] = self.sw_cookie[sw_id]["last_flow_cookie"] + 1
-
-        return self.sw_cookie[sw_id]["last_flow_cookie"]
-
-
-
-    def _get_managed_flow_state(self, in_port, dst, src, datapath):
-        packet_statistics = self.unmanaged_flows[(in_port, dst, src, datapath)]
-
-        last_ind = len(packet_statistics)
-        time_diff = (datetime.now() - packet_statistics[0][0]).total_seconds()
-
-        if last_ind >= self.min_flow_stats_sample:
-            if time_diff > self.activation_delay:
-                index_prev = last_ind - 2
-                index_last = last_ind - 1
-                packet_count = packet_statistics[index_last][1] - packet_statistics[index_prev][1]
-
-                #logger.debug(f'_can_be_managed_flow for {in_port, dst, src, datapath} stats index {last_ind} and time {time_diff}')
-                if packet_count >= self.min_packet_in_period:
-                    #logger.debug(f'{in_port, dst, src, datapath} watcher is initiated')
-                    return 1
-                else:
-                    #logger.debug(f'{in_port, dst, src, datapath} watcher is idle expired')
-                    return 0
-            else:
-                return -1
-        else:
-            if time_diff < self.activation_delay:
-                return -1
-            else:
-                return 0
+        self.no_flood_ports = None
 
     def _monitor_initial_flows(self):
         completed = False
         while not completed:
-            key_list = list(self.unmanaged_flows.keys())
+            key_list = list(self.candidate_flows.keys())
             for (in_port, dst, src, datapath) in key_list:
                 state = self._get_managed_flow_state(in_port, dst, src, datapath)
                 if state == -1:
                     self._request_flow_packet_count(in_port, dst, src, datapath)
-                    logger.debug(f'In waiting state: OFPFlowStatsRequest is sent fpr {in_port, dst, src, datapath}')
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f'In waiting state: OFPFlowStatsRequest is sent fpr {in_port, dst, src, datapath}')
                 elif state == 0:
-                    del self.unmanaged_flows[(in_port, dst, src, datapath)]
-                    logger.debug(f'In expired state: deleted from map {in_port, dst, src, datapath}')
+                    del self.candidate_flows[(in_port, dst, src, datapath)]
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(f'In expired state: deleted from map {in_port, dst, src, datapath}')
                 elif state == 1:
-                    del self.unmanaged_flows[(in_port, dst, src, datapath)]
+                    del self.candidate_flows[(in_port, dst, src, datapath)]
                     dp_list = self.datapath_list
                     h1 = self.hosts[src]
                     h2 = self.hosts[dst]
@@ -152,6 +105,40 @@ class MultipathControllerApp(app_manager.RyuApp):
             del self.flow_managers[flow.flow_info]
             if logger.isEnabledFor(level=logging.INFO):
                 logger.info(f"Terminate flow manager {flow.flow_info}  at {datetime.now()}")
+
+    def _get_next_flow_cookie(self, sw_id):
+        if not sw_id in self.sw_cookie:
+            self.sw_cookie[sw_id] = defaultdict()
+            self.sw_cookie[sw_id]["sw_cookie"] = self.unused_cookie
+            self.sw_cookie[sw_id]["last_flow_cookie"] = self.unused_cookie
+            self.unused_cookie = self.unused_cookie + 0x0010000
+
+        self.sw_cookie[sw_id]["last_flow_cookie"] = self.sw_cookie[sw_id]["last_flow_cookie"] + 1
+
+        return self.sw_cookie[sw_id]["last_flow_cookie"]
+
+    def _get_managed_flow_state(self, in_port, dst, src, datapath):
+        packet_statistics = self.candidate_flows[(in_port, dst, src, datapath)]
+
+        last_ind = len(packet_statistics)
+        time_diff = (datetime.now() - packet_statistics[0][0]).total_seconds()
+
+        if last_ind > self.min_flow_stats_sample:
+            if time_diff > self.activation_delay:
+                index_prev = last_ind - 2
+                index_last = last_ind - 1
+                packet_count = packet_statistics[index_last][1] - packet_statistics[index_prev][1]
+                if packet_count >= self.min_packet_in_period:
+                    return 1
+                else:
+                    return 0
+            else:
+                return -1
+        else:
+            if time_diff < self.activation_delay:
+                return -1
+            else:
+                return 0
 
     def _request_flow_packet_count(self, in_port, dst, src, datapath_id):
         datapath = self.datapath_list[datapath_id]
@@ -182,7 +169,8 @@ class MultipathControllerApp(app_manager.RyuApp):
             if max_packet_count < flow.packet_count:
                 max_packet_count = flow.packet_count
             if initial:
-                in_port = flow.match["in_port"]
+                if "in_port" in flow.match:
+                    in_port = flow.match["in_port"]
 
                 if "eth_src" in flow.match:
                     eth_src = flow.match["eth_src"]
@@ -191,15 +179,11 @@ class MultipathControllerApp(app_manager.RyuApp):
                     eth_dst = flow.match["eth_dst"]
                 initial = False
 
-        if (in_port, eth_dst, eth_src, datapath_id) in self.unmanaged_flows:
-            stat = self.unmanaged_flows[ (in_port, eth_dst, eth_src, datapath_id)]
+        if (in_port, eth_dst, eth_src, datapath_id) in self.candidate_flows:
+            stat = self.candidate_flows[ (in_port, eth_dst, eth_src, datapath_id)]
             stat.append((datetime.now(), max_packet_count))
-            logger.debug(f'OFPFlowStatsReply is processed for {in_port, eth_dst, eth_src, datapath_id}: {(datetime.now(), max_packet_count)}')
-
-       # for stat in sorted([flow for flow in body if flow.priority == 1],
-       #                    key=lambda flow: (flow.match['in_port'], flow.match['eth_dst'])
-
-
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f'OFPFlowStatsReply is processed for {in_port, eth_dst, eth_src, datapath_id}: {(datetime.now(), max_packet_count)}')
 
     def get_active_path_port_for(self, src, first_port, dst, last_port, ip_src, ip_dst, current_dpid, eth_src, eth_dst):
         if (src, first_port, dst, last_port, ip_src, ip_dst) in self.flow_managers:
@@ -210,13 +194,11 @@ class MultipathControllerApp(app_manager.RyuApp):
             return output_port
 
 
-        if (first_port, eth_dst, eth_src, current_dpid) not in self.unmanaged_flows:
-            self.unmanaged_flows[(first_port, eth_dst, eth_src, current_dpid)] = []
-            self.unmanaged_flows[(first_port, eth_dst, eth_src, current_dpid)].append((datetime.now(), 0))
+        if (first_port, eth_dst, eth_src, current_dpid) not in self.candidate_flows:
+            self.candidate_flows[(first_port, eth_dst, eth_src, current_dpid)] = []
+            self.candidate_flows[(first_port, eth_dst, eth_src, current_dpid)].append((datetime.now(), 0))
 
         return None
-
-
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None, hard_timeout=0, flags=0, cookie=0,
                  table_id=0, idle_timeout=0, caller=None):
@@ -271,6 +253,7 @@ class MultipathControllerApp(app_manager.RyuApp):
         match1 = ofp_parser.OFPMatch(eth_type=0x86DD)  # IPv6
         self.add_flow(datapath, 999, match1, actions, flags=0)
 
+
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_stats_reply_handler(self, ev):
         switch = ev.msg.datapath
@@ -283,16 +266,24 @@ class MultipathControllerApp(app_manager.RyuApp):
                 sw_ports[port.port_no] = port
                 max_bw = 0
                 if port.state & 0x01 != 1:  # select port with status different than OFPPS_LINK_DOWN
-
-                    for prop in port.properties:
-                        # select maximum speed
-                        if max_bw < prop.curr_speed:
-                            max_bw = prop.curr_speed
+                    if switch.ofproto.OFP_VERSION <= ofproto_v1_3.OFP_VERSION:
+                        if max_bw < port.curr_speed:
+                            max_bw = port.curr_speed
                         if logger.isEnabledFor(level=logging.DEBUG):
                             # curr value is feature of port. 2112 (dec) and 0x840 Copper and 10 Gb full-duplex rate support
                             # type 0: ethernet 1: optical 0xFFFF: experimenter
-                            logger.debug("Port:%s type:%d state:%s - current features=0x%x, current speed:%s kbps"
-                                         % (port.port_no, prop.type, port.state, prop.curr, prop.curr_speed,))
+                            logger.debug("Port:%s state:%s - current features=0x%x, current speed:%s kbps"
+                                         % (port.port_no, port.state, port.curr, port.curr_speed,))
+                    else:
+                        for prop in port.properties:
+                            # select maximum speed
+                            if max_bw < prop.curr_speed:
+                                max_bw = prop.curr_speed
+                            if logger.isEnabledFor(level=logging.DEBUG):
+                                # curr value is feature of port. 2112 (dec) and 0x840 Copper and 10 Gb full-duplex rate support
+                                # type 0: ethernet 1: optical 0xFFFF: experimenter
+                                logger.debug("Port:%s type:%d state:%s - current features=0x%x, current speed:%s kbps"
+                                             % (port.port_no, prop.type, port.state, prop.curr, prop.curr_speed,))
                 port_bandwidths[port.port_no] = max_bw
             self.topology.nodes[switch.id]["port_desc_stats"] = sw_ports
             self.topology.nodes[switch.id]["port_bandwidths"] = port_bandwidths
@@ -300,6 +291,9 @@ class MultipathControllerApp(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
+        if msg.cookie > 0:
+            pass
+
         datapath = msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
@@ -307,23 +301,20 @@ class MultipathControllerApp(app_manager.RyuApp):
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
-
         # avoid broadcast from LLDP
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
-            return None
+            return
+
 
         if pkt.get_protocol(ipv6.ipv6):
-            return None
+            return
 
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
 
-
-
         if dpid not in self.mac_to_port:
             self.mac_to_port[dpid] = {}
-            self.ip_to_port[dpid] = {}
 
         logger.debug("packet in %s %s %s %s", dpid, src, dst, in_port)
 
@@ -344,7 +335,6 @@ class MultipathControllerApp(app_manager.RyuApp):
             #ignore other packets
             return
 
-        self.ip_to_port[dpid][src_ip] = in_port
         if src not in self.hosts:
             self.hosts[src] = (dpid, in_port, src_ip)
 
@@ -361,12 +351,22 @@ class MultipathControllerApp(app_manager.RyuApp):
             else:
                 out_port = ofproto.OFPP_FLOOD
 
-        actions = [parser.OFPActionOutput(out_port)]
-
         # install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:
+            actions = [parser.OFPActionOutput(out_port)]
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
             self.add_flow(datapath, 1, match, actions, idle_timeout=5)
+        else:
+            if self.no_flood_ports is None:
+                self._recalculate_flood_ports()
+            actions = []
+            if dpid in self.no_flood_ports:
+                for port, port_info in self.datapath_list[dpid].ports.items():
+                    if port_info.state == 4 and port not in self.no_flood_ports[dpid]:
+                        if port != in_port:
+                            actions.append(parser.OFPActionOutput(port))
+            else:
+                actions.append(parser.OFPActionOutput(out_port))
 
         data = None
         if msg.buffer_id == ofproto.OFP_NO_BUFFER:
@@ -376,11 +376,49 @@ class MultipathControllerApp(app_manager.RyuApp):
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
 
+    def send_port_mod(self, datapath):
+        ofp = datapath.ofproto
+        ofp_parser = datapath.ofproto_parser
 
+        port_no = 3
+        hw_addr = 'fa:c8:e8:76:1d:7e'
+        config = 0
+        mask = (ofp.OFPPC_NO_FLOOD | ofp.OFPPC_NO_PACKET_IN)
+        advertise = 0
+        req = ofp_parser.OFPPortMod(datapath, port_no, hw_addr, config,
+                                    mask, advertise)
+        datapath.send_msg(req)
+
+    def _recalculate_flood_ports(self):
+        nodes = list(self.topology.nodes)
+        edges =list(self.topology.edges)
+        graph = nx.Graph()
+        graph.add_nodes_from(nodes)
+        graph.add_edges_from(edges)
+
+        spanning_tree = nx.minimum_spanning_tree(graph)
+
+        no_flood_links = list(set(graph.edges) - set(spanning_tree.edges))
+        if len(no_flood_links) > 0:
+            self.no_flood_ports = defaultdict()
+            for link in no_flood_links:
+                s1 = link[0]
+                s2 = link[1]
+                e1 = self.topology.edges.get((s1, s2))["port_no"]
+                if s1 not in self.no_flood_ports:
+                    self.no_flood_ports[s1] = set()
+                self.no_flood_ports[s1].add(e1)
+
+                e2 = self.topology.edges.get((s2, s1))["port_no"]
+                if s2 not in self.no_flood_ports:
+                    self.no_flood_ports[s2] = set()
+                self.no_flood_ports[s2].add(e2)
+
+            logger.warning("No Flood Ports is updated: %s" % self.no_flood_ports)
 
     @set_ev_cls(event.EventSwitchEnter)
     def _switch_enter_handler(self, ev):
-        if logger.isEnabledFor(level=logging.INFO):
+        if logger.isEnabledFor(level=logging.DEBUG):
             logger.debug(ev)
         switch = ev.switch.dp
         ofp_parser = switch.ofproto_parser
@@ -402,13 +440,20 @@ class MultipathControllerApp(app_manager.RyuApp):
 
     @set_ev_cls(event.EventLinkAdd, MAIN_DISPATCHER)
     def _link_add_handler(self, ev):
+        if logger.isEnabledFor(level=logging.INFO):
+            logger.debug(ev)
         s1 = ev.link.src
         s2 = ev.link.dst
         self.topology.add_edge(s1.dpid, s2.dpid, port_no=s1.port_no)
         self.topology.add_edge(s2.dpid, s1.dpid, port_no=s2.port_no)
+        if self.no_flood_ports is not None:
+            self._recalculate_flood_ports()
+
 
     @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
     def link_delete_handler(self, ev):
+        if logger.isEnabledFor(level=logging.INFO):
+            logger.debug(ev)
         s1 = ev.link.src
         s2 = ev.link.dst
         if (s1.dpid, s2.dpid) in self.topology.edges:

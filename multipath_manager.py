@@ -4,7 +4,6 @@ from collections import defaultdict
 from datetime import datetime
 import random
 import time
-from threading import RLock, Timer, Thread
 
 import networkx as nx
 
@@ -14,7 +13,7 @@ from ryu.lib import hub
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
-logger.setLevel(level=logging.WARNING)
+logger.setLevel(level=logging.INFO)
 REFERENCE_BW = 10000000
 
 
@@ -56,9 +55,6 @@ class FlowMultipathManager(object):
         self.flow_id_rule_set = defaultdict()
 
         self.statistics = defaultdict()
-        #self.lock = RLock()
-
-        ### new added
 
         self.active_queue = queue.Queue()
         self.initiated_queue = queue.Queue()
@@ -67,20 +63,93 @@ class FlowMultipathManager(object):
 
         self.active_path = None
         self.active_path_index = -1
-        #self.update_paths()
 
-    def _set_state(self, state):
-        self.state = state
-        if logger.isEnabledFor(logging.INFO):
-            logger.info('state is now: %s for %s ' % (self.state, self.flow_info))
+    @staticmethod
+    def date_time_converter(o):
+        if isinstance(o, object):
+            return o.__str__()
 
-    def _monitor(self):
+    @staticmethod
+    def delete_flow(datapath, cookie):
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        mod = parser.OFPFlowMod(datapath=datapath,
+                                command=ofproto.OFPFC_DELETE,
+                                out_port=ofproto.OFPP_ANY,
+                                out_group=ofproto.OFPG_ANY,
+                                table_id=ofproto.OFPTT_ALL,
+                                cookie=cookie,
+                                cookie_mask=0xFFFFFFFFFFFFFFFF,
+                                )
+        datapath.send_msg(mod)
+
+    def get_status(self):
+        return self.state
+
+    def get_active_path_port_for(self, datapath_id):
+        if self.state == FlowMultipathManager.NOT_ACTIVE:
+            hub.spawn(self._maintain_paths)
+            hub.spawn(self._manage_timing)
+            return None
+
+        if self.active_path is not None and datapath_id in self.active_path:
+            first_output_port = self.active_path[datapath_id][1]
+            return first_output_port
+        else:
+            return None
+
+    def flow_removed(self, msg):
+        # called by owner
+        if msg.cookie in self.flow_id_rule_set:
+            rule_set_id = self.flow_id_rule_set[msg.cookie]
+            if rule_set_id in self.statistics["rule_set"]:
+                if msg.datapath.id in self.statistics["rule_set"][rule_set_id]["datapath_list"]:
+                    stats = self.statistics["rule_set"][rule_set_id]["datapath_list"][msg.datapath.id]["ip_flow"]
+                    if msg.cookie in stats:
+                        stats[msg.cookie]["removed_time"] = datetime.timestamp(datetime.now())
+                        stats[msg.cookie]["packet_count"] = msg.packet_count
+
+                        deleted_count = self.statistics["rule_set"][self.rule_set_id]["deleted_ip_flow_count"]
+                        self.statistics["rule_set"][self.rule_set_id]["deleted_ip_flow_count"] = deleted_count + 1
+
+                        max_ip_packet = self.statistics["rule_set"][self.rule_set_id]["max_ip_packet_count"]
+                        if msg.packet_count > max_ip_packet:
+                            self.statistics["rule_set"][self.rule_set_id]["max_ip_packet_count"] = msg.packet_count
+
+                    stats = self.statistics["rule_set"][rule_set_id]["datapath_list"][msg.datapath.id]["arp_flow"]
+                    if msg.cookie in stats:
+                        stats[msg.cookie]["removed_time"] = datetime.timestamp(datetime.now())
+                        stats[msg.cookie]["packet_count"] = msg.packet_count
+
+                        deleted_count = self.statistics["rule_set"][self.rule_set_id]["deleted_arp_flow_count"]
+                        self.statistics["rule_set"][self.rule_set_id]["deleted_arp_flow_count"] = deleted_count + 1
+
+                        max_arp_packet = self.statistics["rule_set"][self.rule_set_id]["max_arp_packet_count"]
+                        if msg.packet_count > max_arp_packet:
+                            self.statistics["rule_set"][self.rule_set_id]["max_arp_packet_count"] = msg.packet_count
+
+                deleted_ip_flow = self.statistics["rule_set"][self.rule_set_id]["deleted_ip_flow_count"]
+                deleted_arp_flow = self.statistics["rule_set"][self.rule_set_id]["deleted_arp_flow_count"]
+                path_count = len(self.statistics["rule_set"][self.rule_set_id]["path"])
+                if self.state == FlowMultipathManager.ACTIVE or self.state == FlowMultipathManager.INITIATED:
+                    if deleted_arp_flow >= path_count and deleted_ip_flow >= path_count:
+                        max_ip_packet = self.statistics["rule_set"][self.rule_set_id]["max_ip_packet_count"]
+                        max_arp_packet = self.statistics["rule_set"][self.rule_set_id]["max_arp_packet_count"]
+                        if max_ip_packet <= 0 and max_arp_packet <= 0:
+                            self.statistics["idle_count"] = self.statistics["idle_count"] + 1
+                            self._set_state(FlowMultipathManager.DESTROYING)
+                            self.multipath_app.flow_manager_is_destroying(self)
+                        else:
+                            self.statistics["idle_count"] = 0
+
+    def _maintain_paths(self):
         if logger.isEnabledFor(logging.INFO):
-            logger.info(f'Monitoring thread has started at {datetime.now()}')
+            logger.info(f'Path management thread has started at {datetime.now()}')
         completed = False
         while not completed:
             if self.state == FlowMultipathManager.DESTROYING:
-                self.delete_paths()
+                self._delete_paths()
                 if self.active_queue.qsize() == 0:
                     self._set_state(FlowMultipathManager.DEAD)
                     # statistics
@@ -93,20 +162,17 @@ class FlowMultipathManager(object):
 
                     completed = True
             else:
-                self.update_paths()
-                self.delete_paths()
+                self._update_paths()
+                self._delete_paths()
 
             hub.sleep(self.min_timeout_time / 4)
         if logger.isEnabledFor(logging.INFO):
-            logger.info(f'Monitoring thread has exited at {datetime.now()}')
+            logger.info(f'Path management has exited at {datetime.now()}')
 
-    @staticmethod
-    def date_time_converter(o):
-        if isinstance(o, object):
-            return o.__str__()
-
-    def _manage_flow_times(self):
+    def _manage_timing(self):
         completed = False
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(f'Timing thread has started at {datetime.now()}')
         while not completed:
             if self.state == FlowMultipathManager.DESTROYING:
                 exit_loop = False
@@ -166,10 +232,12 @@ class FlowMultipathManager(object):
         if logger.isEnabledFor(logging.INFO):
             logger.info(f'Timing thread has exited at {datetime.now()}')
 
-    def get_status(self):
-        return self.state
+    def _set_state(self, state):
+        self.state = state
+        if logger.isEnabledFor(logging.INFO):
+            logger.info('state is now: %s for %s ' % (self.state, self.flow_info))
 
-    def get_paths(self):
+    def _get_all_possible_paths(self):
         """
         Get all paths from src to dst using DFS algorithm
         """
@@ -191,7 +259,7 @@ class FlowMultipathManager(object):
             paths.append(path)
 
         path_copy = paths[:]
-
+        #select only subset paths, eliminate paths contains others
         for x in paths:
             superset = []
             for y in path_copy:
@@ -239,7 +307,7 @@ class FlowMultipathManager(object):
             return self.optimal_paths
 
         start = time.perf_counter()
-        paths = self.get_paths()
+        paths = self._get_all_possible_paths()
         paths_count = len(paths) if len(paths) < self.max_paths else self.max_paths
 
         sorted_paths = sorted(paths, key=lambda x: x[1])[0:paths_count]
@@ -277,7 +345,7 @@ class FlowMultipathManager(object):
             paths_p.append(p)
         return paths_p
 
-    def update_paths(self):
+    def _update_paths(self):
         if self.state == FlowMultipathManager.NOT_ACTIVE:
 
             self._set_state(FlowMultipathManager.INITIATED)
@@ -314,7 +382,7 @@ class FlowMultipathManager(object):
             priority = self.lowest_priority + self.last_installed_path_index
 
             selected_path = self.paths_with_ports[current_path_index]
-            rule_set_id = self.create_flow_rules(selected_path, priority, idle_timeout=self.min_timeout_time*2)
+            rule_set_id = self._create_flow_rules(selected_path, priority, idle_timeout=self.min_timeout_time*2)
             self.active_queue.put_nowait((queue_index, current_path_index, rule_set_id))
 
             self._set_state(FlowMultipathManager.ACTIVE)
@@ -338,36 +406,7 @@ class FlowMultipathManager(object):
         else:
             return None
 
-    def get_active_path_port_for(self, datapath_id):
-        if self.state == FlowMultipathManager.NOT_ACTIVE:
-            self.monitor_thread = hub.spawn(self._monitor)
-            self.time_manager_thread = hub.spawn(self._manage_flow_times)
-            return None
-
-        #assert self.active_path is not None
-        if self.active_path is not None and datapath_id in self.active_path:
-            first_output_port = self.active_path[datapath_id][1]
-            return first_output_port
-        else:
-            return None
-
-
-    @staticmethod
-    def delete_flow(datapath, cookie):
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-
-        mod = parser.OFPFlowMod(datapath=datapath,
-                                command=ofproto.OFPFC_DELETE,
-                                out_port=ofproto.OFPP_ANY,
-                                out_group=ofproto.OFPG_ANY,
-                                table_id=ofproto.OFPTT_ALL,
-                                cookie=cookie,
-                                cookie_mask=0xFFFFFFFFFFFFFFFF,
-                                )
-        datapath.send_msg(mod)
-
-    def delete_paths(self):
+    def _delete_paths(self):
         rule_set_id = -1
         try:
             queue_index, index, rule_set_id = self.delete_queue.get(block=False)
@@ -398,7 +437,7 @@ class FlowMultipathManager(object):
             except queue.Empty:
                 rule_set_id = -1
 
-    def create_flow_rules(self, current_path, priority, hard_timeout=0, idle_timeout=0):
+    def _create_flow_rules(self, current_path, priority, hard_timeout=0, idle_timeout=0):
         self.rule_set_id = self.rule_set_id + 1
         self.statistics["rule_set"][self.rule_set_id] = defaultdict()
 
@@ -477,47 +516,3 @@ class FlowMultipathManager(object):
             stats[flow_id]["flow_params"] = (node, match_arp, actions)
 
         return self.rule_set_id
-
-    def flow_removed(self, msg):
-
-        if msg.cookie in self.flow_id_rule_set:
-            rule_set_id = self.flow_id_rule_set[msg.cookie]
-            if rule_set_id in self.statistics["rule_set"]:
-                if msg.datapath.id in self.statistics["rule_set"][rule_set_id]["datapath_list"]:
-                    stats = self.statistics["rule_set"][rule_set_id]["datapath_list"][msg.datapath.id]["ip_flow"]
-                    if msg.cookie in stats:
-                        stats[msg.cookie]["removed_time"] = datetime.timestamp(datetime.now())
-                        stats[msg.cookie]["packet_count"] = msg.packet_count
-
-                        deleted_count = self.statistics["rule_set"][self.rule_set_id]["deleted_ip_flow_count"]
-                        self.statistics["rule_set"][self.rule_set_id]["deleted_ip_flow_count"] = deleted_count + 1
-
-                        max_ip_packet = self.statistics["rule_set"][self.rule_set_id]["max_ip_packet_count"]
-                        if msg.packet_count > max_ip_packet:
-                            self.statistics["rule_set"][self.rule_set_id]["max_ip_packet_count"] = msg.packet_count
-
-                    stats = self.statistics["rule_set"][rule_set_id]["datapath_list"][msg.datapath.id]["arp_flow"]
-                    if msg.cookie in stats:
-                        stats[msg.cookie]["removed_time"] = datetime.timestamp(datetime.now())
-                        stats[msg.cookie]["packet_count"] = msg.packet_count
-
-                        deleted_count = self.statistics["rule_set"][self.rule_set_id]["deleted_arp_flow_count"]
-                        self.statistics["rule_set"][self.rule_set_id]["deleted_arp_flow_count"] = deleted_count + 1
-
-                        max_arp_packet = self.statistics["rule_set"][self.rule_set_id]["max_arp_packet_count"]
-                        if msg.packet_count > max_arp_packet:
-                            self.statistics["rule_set"][self.rule_set_id]["max_arp_packet_count"] = msg.packet_count
-
-                deleted_ip_flow = self.statistics["rule_set"][self.rule_set_id]["deleted_ip_flow_count"]
-                deleted_arp_flow = self.statistics["rule_set"][self.rule_set_id]["deleted_arp_flow_count"]
-                path_count = len(self.statistics["rule_set"][self.rule_set_id]["path"])
-                if self.state == FlowMultipathManager.ACTIVE or self.state == FlowMultipathManager.INITIATED:
-                    if deleted_arp_flow >= path_count and deleted_ip_flow >= path_count:
-                        max_ip_packet = self.statistics["rule_set"][self.rule_set_id]["max_ip_packet_count"]
-                        max_arp_packet = self.statistics["rule_set"][self.rule_set_id]["max_arp_packet_count"]
-                        if max_ip_packet <= 0 and max_arp_packet <= 0:
-                            self.statistics["idle_count"] = self.statistics["idle_count"] + 1
-                            self._set_state(FlowMultipathManager.DESTROYING)
-                            self.multipath_app.flow_manager_is_destroying(self)
-                        else:
-                            self.statistics["idle_count"] = 0

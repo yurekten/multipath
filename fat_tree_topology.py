@@ -7,6 +7,24 @@ import os
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+class OVSBridgeSTP( OVSSwitch ):
+    """Open vSwitch Ethernet bridge with Spanning Tree Protocol
+       rooted at the first bridge that is created"""
+    def __init__(self, name, failMode='secure', datapath='kernel',
+                 inband=False, protocols=None,
+                 reconnectms=1000, stp=False, batch=False, stp_priority=100,  **params):
+        super(OVSBridgeSTP, self).__init__(name, failMode, datapath,
+                 inband, protocols, reconnectms, stp, batch, **params)
+        self.stp_priority = stp_priority
+
+    def start( self, *args, **kwargs ):
+        super(OVSBridgeSTP, self).start(*args, **kwargs)
+        self.cmd( 'ovs-vsctl set-fail-mode', self, 'standalone' )
+        self.cmd( 'ovs-vsctl set-controller', self )
+        self.cmd( 'ovs-vsctl set Bridge', self,
+                  'stp_enable=true',
+                  'other_config:stp-priority=%d' % self.stp_priority )
+
 class FatTree(Topo):
     CoreSwitchList = []
     AggSwitchList = []
@@ -57,7 +75,7 @@ class FatTree(Topo):
             PREFIX = str(level) + "00"
             if x >= int(10):
                 PREFIX = str(level) + "0"
-            switch_list.append(self.addSwitch('s' + PREFIX + str(x), failMode= "standalone", stp=True))
+            switch_list.append(self.addSwitch('s' + PREFIX + str(x), dpid="%s" % (PREFIX + str(x)), failMode= "standalone", stp=True))
 
     def createCoreLayerSwitch(self, NUMBER):
         logger.debug("Create Core Layer")
@@ -129,12 +147,14 @@ import time
 
 CONTROLLER_IP = "127.0.0.1"
 CONTROLLER_PORT = 6653
-OPENFLOW_PROTOCOL = 'OpenFlow15'
+OPENFLOW_PROTOCOL = 'OpenFlow14'
 IP_BASE = "10.0.88.0/24"
 # DPID_BASE = 0x1000
-DPID_BASE = 1000
+DPID_BASE = 0x1000
 
 if __name__ == '__main__':
+
+    net = Containernet(ipBase=IP_BASE)
     try:
         call(["mn", "-c"])
         dpid = DPID_BASE
@@ -142,7 +162,6 @@ if __name__ == '__main__':
 
         mySwitch = partial(OVSKernelSwitch, protocols=OPENFLOW_PROTOCOL)
 
-        net = Containernet(ipBase=IP_BASE)
         net.addController("c0", controller=RemoteController, link=TCLink, ip=CONTROLLER_IP, port=CONTROLLER_PORT)
 
         net.buildFromTopo(FatTree(4))
