@@ -26,7 +26,7 @@ class FlowMultipathManager(object):
     STATES = { 0: "NOT_ACTIVE", 1:"INITIATED", 2:"ACTIVE", 3:"DESTROYING", 4:"DEAD"}
 
     def __init__(self, multipath_app, graph, dp_list, src, first_port, dst, last_port, ip_src, ip_dst, max_paths=100,
-                 max_installed_path_count=3, max_time_period_in_second=4, lowest_priority=30000):
+                 max_installed_path_count=2, max_time_period_in_second=1, lowest_priority=30000):
         self.state = FlowMultipathManager.NOT_ACTIVE
         self.multipath_app = multipath_app
         self.topology = graph
