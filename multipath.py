@@ -1,5 +1,6 @@
 from datetime import datetime
 from random import random
+from threading import RLock
 
 from ryu.base import app_manager
 from ryu.controller import mac_to_port
@@ -35,15 +36,15 @@ import logging
 from multipath_manager import FlowMultipathManager
 
 logger = logging.getLogger(__name__)
-logger.setLevel(level=logging.INFO)
+logger.setLevel(level=logging.WARNING)
 
 
 class MultipathControllerApp(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_4.OFP_VERSION]
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, multipath_enabled=True, *args, **kwargs):
         super(MultipathControllerApp, self).__init__(*args, **kwargs)
-
+        self.multipath_enabled = multipath_enabled
         self.sw_cookie = defaultdict()
         self.unused_cookie = 0x0010000
         self.flow_managers = defaultdict()
@@ -59,16 +60,22 @@ class MultipathControllerApp(app_manager.RyuApp):
         self.mac_to_port = {}
         self.candidate_flows = {}
 
-
-        self.activation_delay = 2 #start if flow is active 2 seconds
+        #TODO: Optimize parameters
+        self.activation_delay = 1 #start if flow is active 2 seconds
         self.flow_stats_sampling_period = 0.3
         self.min_flow_stats_sample = 1
 
-        self.min_packet_in_period = 3
+        self.min_packet_in_period = 10
 
-        hub.spawn(self._monitor_initial_flows)
+        #hub.spawn(self._monitor_initial_flows)
 
         self.no_flood_ports = None
+
+        self.lock = RLock()
+        if self.multipath_enabled:
+            logger.warning("SDN Controleller started - multipath management is ENABLED")
+        else:
+            logger.warning("SDN Controleller started - multipath management is DISABLED")
 
     def _monitor_initial_flows(self):
         completed = False
@@ -86,25 +93,34 @@ class MultipathControllerApp(app_manager.RyuApp):
                         logger.debug(f'In expired state: deleted from map {in_port, dst, src, datapath}')
                 elif state == 1:
                     del self.candidate_flows[(in_port, dst, src, datapath)]
-                    dp_list = self.datapath_list
-                    h1 = self.hosts[src]
-                    h2 = self.hosts[dst]
-
-                    flow_manager = FlowMultipathManager(self, self.topology, dp_list, h1[0], h1[1], h2[0], h2[1], h1[2], h2[2])
-
-                    self.flow_managers[flow_manager.flow_info] = flow_manager
-                    flow_manager.get_active_path_port_for(dp_list[h1[0]])
-
-                    if logger.isEnabledFor(level=logging.INFO):
-                        logger.info(f"Initiate flow manager {flow_manager.flow_info} at {datetime.now()}")
+                    self._start_flow_manager(dst, src)
 
             hub.sleep(self.flow_stats_sampling_period)
 
+    def _start_flow_manager(self, dst, src):
+
+        with self.lock:
+
+            h1 = self.hosts[src]
+            h2 = self.hosts[dst]
+            if (h1[0], h1[1], h2[0], h2[1], h1[2], h2[2]) in self.flow_managers:
+                return
+
+            dp_list = self.datapath_list
+
+            flow_manager = FlowMultipathManager(self, self.topology, dp_list, h1[0], h1[1], h2[0], h2[1], h1[2], h2[2])
+            self.flow_managers[flow_manager.flow_info] = flow_manager
+            flow_manager.get_active_path_port_for(dp_list[h1[0]])
+            if logger.isEnabledFor(level=logging.WARNING):
+                logger.warning(f"Initiate flow manager {flow_manager.flow_info} at {datetime.now()}")
+
+
     def flow_manager_is_destroying(self, flow):
-        if flow.flow_info in self.flow_managers:
-            del self.flow_managers[flow.flow_info]
-            if logger.isEnabledFor(level=logging.INFO):
-                logger.info(f"Terminate flow manager {flow.flow_info}  at {datetime.now()}")
+        with self.lock:
+            if flow.flow_info in self.flow_managers:
+                del self.flow_managers[flow.flow_info]
+                if logger.isEnabledFor(level=logging.WARNING):
+                    logger.warning(f"Terminate flow manager {flow.flow_info}  at {datetime.now()}")
 
     def _get_next_flow_cookie(self, sw_id):
         if not sw_id in self.sw_cookie:
@@ -123,11 +139,14 @@ class MultipathControllerApp(app_manager.RyuApp):
         last_ind = len(packet_statistics)
         time_diff = (datetime.now() - packet_statistics[0][0]).total_seconds()
 
+        if time_diff < self.activation_delay:
+            return -1
+
         if last_ind > self.min_flow_stats_sample:
             if time_diff > self.activation_delay:
                 index_prev = last_ind - 2
                 index_last = last_ind - 1
-                packet_count = packet_statistics[index_last][1] - packet_statistics[index_prev][1]
+                packet_count = packet_statistics[index_last][1]
                 if packet_count >= self.min_packet_in_period:
                     return 1
                 else:
@@ -189,14 +208,14 @@ class MultipathControllerApp(app_manager.RyuApp):
         if (src, first_port, dst, last_port, ip_src, ip_dst) in self.flow_managers:
             flow_manager = self.flow_managers[(src, first_port, dst, last_port, ip_src, ip_dst)]
             output_port = flow_manager.get_active_path_port_for(current_dpid)
-            if logger.isEnabledFor(level=logging.INFO):
-                logger.info(f"flow manager for {(src, first_port, dst, last_port, ip_src, ip_dst)} is started")
+            #if logger.isEnabledFor(level=logging.INFO):
+            #    logger.info(f"flow manager for {(src, first_port, dst, last_port, ip_src, ip_dst)} is started")
             return output_port
 
 
-        if (first_port, eth_dst, eth_src, current_dpid) not in self.candidate_flows:
-            self.candidate_flows[(first_port, eth_dst, eth_src, current_dpid)] = []
-            self.candidate_flows[(first_port, eth_dst, eth_src, current_dpid)].append((datetime.now(), 0))
+        # if (first_port, eth_dst, eth_src, current_dpid) not in self.candidate_flows:
+        #     self.candidate_flows[(first_port, eth_dst, eth_src, current_dpid)] = []
+        #     self.candidate_flows[(first_port, eth_dst, eth_src, current_dpid)].append((datetime.now(), 0))
 
         return None
 
@@ -257,7 +276,8 @@ class MultipathControllerApp(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_stats_reply_handler(self, ev):
         switch = ev.msg.datapath
-        print("Port Description Stats for Switch %s" % switch.id)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Port Description Stats for Switch %s" % switch.id)
         if switch.id in self.topology.nodes:
 
             sw_ports = defaultdict()
@@ -291,8 +311,6 @@ class MultipathControllerApp(app_manager.RyuApp):
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
         msg = ev.msg
-        if msg.cookie > 0:
-            pass
 
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -355,7 +373,10 @@ class MultipathControllerApp(app_manager.RyuApp):
         if out_port != ofproto.OFPP_FLOOD:
             actions = [parser.OFPActionOutput(out_port)]
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
-            self.add_flow(datapath, 1, match, actions, idle_timeout=5)
+            if self.multipath_enabled:
+                self.add_flow(datapath, 3, match, actions, hard_timeout=self.activation_delay, flags=ofproto.OFPFF_SEND_FLOW_REM)
+
+            self.add_flow(datapath, 1, match, actions, idle_timeout=(self.activation_delay + 2))
         else:
             if self.no_flood_ports is None:
                 self._recalculate_flood_ports()
@@ -376,19 +397,6 @@ class MultipathControllerApp(app_manager.RyuApp):
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
 
-    def send_port_mod(self, datapath):
-        ofp = datapath.ofproto
-        ofp_parser = datapath.ofproto_parser
-
-        port_no = 3
-        hw_addr = 'fa:c8:e8:76:1d:7e'
-        config = 0
-        mask = (ofp.OFPPC_NO_FLOOD | ofp.OFPPC_NO_PACKET_IN)
-        advertise = 0
-        req = ofp_parser.OFPPortMod(datapath, port_no, hw_addr, config,
-                                    mask, advertise)
-        datapath.send_msg(req)
-
     def _recalculate_flood_ports(self):
         nodes = list(self.topology.nodes)
         edges =list(self.topology.edges)
@@ -399,8 +407,9 @@ class MultipathControllerApp(app_manager.RyuApp):
         spanning_tree = nx.minimum_spanning_tree(graph)
 
         no_flood_links = list(set(graph.edges) - set(spanning_tree.edges))
+
+        self.no_flood_ports = defaultdict()
         if len(no_flood_links) > 0:
-            self.no_flood_ports = defaultdict()
             for link in no_flood_links:
                 s1 = link[0]
                 s2 = link[1]
@@ -414,7 +423,7 @@ class MultipathControllerApp(app_manager.RyuApp):
                     self.no_flood_ports[s2] = set()
                 self.no_flood_ports[s2].add(e2)
 
-            logger.warning("No Flood Ports is updated: %s" % self.no_flood_ports)
+            logger.warning("Flood Ports is updated using spanning tree: %s" % self.no_flood_ports)
 
     @set_ev_cls(event.EventSwitchEnter)
     def _switch_enter_handler(self, ev):
@@ -470,4 +479,20 @@ class MultipathControllerApp(app_manager.RyuApp):
             if msg.cookie in self.flows[dp.id]:
                 manager = self.flows[dp.id][msg.cookie]
                 manager[1].flow_removed(msg)
+                del self.flows[dp.id][msg.cookie]
+
+    def flow_removed(self, msg):
+        ofproto = msg.datapath.ofproto
+        if self.multipath_enabled:
+            if msg.reason == ofproto.OFPRR_HARD_TIMEOUT:
+                if msg.packet_count > self.min_packet_in_period:
+                    eth_src = None
+                    eth_dst = None
+                    if "eth_src" in msg.match:
+                        eth_src = msg.match["eth_src"]
+                    if "eth_dst" in msg.match:
+                        eth_dst = msg.match["eth_dst"]
+
+                    if eth_src is not None and eth_dst is not None:
+                        self._start_flow_manager(eth_dst, eth_src)
 

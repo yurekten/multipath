@@ -11,8 +11,10 @@ def main():
     sys.argv.append('--ofp-tcp-listen-port')
     sys.argv.append('6653')
     sys.argv.append('--enable-debugger')
+
     sys.argv.append('--observe-links')
     sys.argv.append('multipath')
+
     # sys.argv.append('ryu.app.rest_topology')
     # sys.argv.append('ryu.app.ws_topology')
     # sys.argv.append('ryu.app.ofctl_rest')

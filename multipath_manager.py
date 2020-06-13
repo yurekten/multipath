@@ -13,7 +13,7 @@ from ryu.lib import hub
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
-logger.setLevel(level=logging.INFO)
+logger.setLevel(level=logging.WARNING)
 REFERENCE_BW = 10000000
 
 
@@ -23,9 +23,10 @@ class FlowMultipathManager(object):
     ACTIVE = 2
     DESTROYING = 3
     DEAD = 4
+    STATES = { 0: "NOT_ACTIVE", 1:"INITIATED", 2:"ACTIVE", 3:"DESTROYING", 4:"DEAD"}
 
-    def __init__(self, multipath_app, graph, dp_list, src, first_port, dst, last_port, ip_src, ip_dst, max_paths=10,
-                 max_installed_path_count=3, min_timeout_time=2, lowest_priority=30000):
+    def __init__(self, multipath_app, graph, dp_list, src, first_port, dst, last_port, ip_src, ip_dst, max_paths=100,
+                 max_installed_path_count=3, max_time_period_in_second=4, lowest_priority=30000):
         self.state = FlowMultipathManager.NOT_ACTIVE
         self.multipath_app = multipath_app
         self.topology = graph
@@ -38,7 +39,7 @@ class FlowMultipathManager(object):
         self.ip_dst = ip_dst
         self.max_paths = max_paths
         self.max_installed_path_count = max_installed_path_count
-        self.min_timeout_time = min_timeout_time
+        self.max_time_period_in_second = max_time_period_in_second
         self.lowest_priority = lowest_priority
 
         self.flow_info = (src, first_port, dst, last_port, ip_src, ip_dst,)
@@ -133,10 +134,12 @@ class FlowMultipathManager(object):
                 deleted_arp_flow = self.statistics["rule_set"][self.rule_set_id]["deleted_arp_flow_count"]
                 path_count = len(self.statistics["rule_set"][self.rule_set_id]["path"])
                 if self.state == FlowMultipathManager.ACTIVE or self.state == FlowMultipathManager.INITIATED:
-                    if deleted_arp_flow >= path_count and deleted_ip_flow >= path_count:
+                    #if deleted_arp_flow >= path_count and deleted_ip_flow >= path_count:
+                    if deleted_ip_flow >= path_count:
                         max_ip_packet = self.statistics["rule_set"][self.rule_set_id]["max_ip_packet_count"]
                         max_arp_packet = self.statistics["rule_set"][self.rule_set_id]["max_arp_packet_count"]
-                        if max_ip_packet <= 0 and max_arp_packet <= 0:
+                        #if max_ip_packet <= 0 and max_arp_packet <= 0:
+                        if max_ip_packet <= 0:
                             self.statistics["idle_count"] = self.statistics["idle_count"] + 1
                             self._set_state(FlowMultipathManager.DESTROYING)
                             self.multipath_app.flow_manager_is_destroying(self)
@@ -144,8 +147,8 @@ class FlowMultipathManager(object):
                             self.statistics["idle_count"] = 0
 
     def _maintain_paths(self):
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(f'Path management thread has started at {datetime.now()}')
+        if logger.isEnabledFor(logging.WARNING):
+            logger.warning(f'Path management thread has started at {datetime.now()}')
         completed = False
         while not completed:
             if self.state == FlowMultipathManager.DESTROYING:
@@ -165,14 +168,14 @@ class FlowMultipathManager(object):
                 self._update_paths()
                 self._delete_paths()
 
-            hub.sleep(self.min_timeout_time / 4)
+            hub.sleep(self.max_time_period_in_second / 2)
         if logger.isEnabledFor(logging.INFO):
-            logger.info(f'Path management has exited at {datetime.now()}')
+            logger.info(f'Path management for {self.flow_info} has exited at {datetime.now()}')
 
     def _manage_timing(self):
         completed = False
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(f'Timing thread has started at {datetime.now()}')
+        if logger.isEnabledFor(logging.WARNING):
+            logger.warning(f'{datetime.now()} - Timing thread has started')
         while not completed:
             if self.state == FlowMultipathManager.DESTROYING:
                 exit_loop = False
@@ -212,11 +215,14 @@ class FlowMultipathManager(object):
                                                     % (self.flow_info, index, deleted_item, datetime.now(),))
                                 else:
                                     break
-                        hub.sleep(self.min_timeout_time)
+                        random_wait_time = (self.max_time_period_in_second / 2) + random.random() * (self.max_time_period_in_second / 2)
+                        hub.sleep(random_wait_time)
                     except queue.Empty:
-                        hub.sleep(self.min_timeout_time / 4)
+                        random_wait_time = (self.max_time_period_in_second / 4) + random.random() * (self.max_time_period_in_second / 4)
+                        hub.sleep(random_wait_time)
                 else:
-                    hub.sleep(self.min_timeout_time / 4)
+                    random_wait_time = (self.max_time_period_in_second / 4) + random.random() * (self.max_time_period_in_second / 4)
+                    hub.sleep(random_wait_time)
 
                 if self.state == FlowMultipathManager.ACTIVE and self.inactive_queue.qsize() < 5:
                     for index in range(0, len(self.path_choices)):
@@ -229,13 +235,14 @@ class FlowMultipathManager(object):
             except queue.Empty:
                 exit_loop = True
 
-        if logger.isEnabledFor(logging.INFO):
-            logger.info(f'Timing thread has exited at {datetime.now()}')
+        if logger.isEnabledFor(logging.WARNING):
+            logger.warning(f'{datetime.now()} - Timing thread {self.flow_info} has exited')
 
     def _set_state(self, state):
-        self.state = state
-        if logger.isEnabledFor(logging.INFO):
-            logger.info('state is now: %s for %s ' % (self.state, self.flow_info))
+        if state != self.state:
+            self.state = state
+            if logger.isEnabledFor(logging.WARNING):
+                logger.warning('%s - State is now: %s for %s ' % (datetime.now(), FlowMultipathManager.STATES[self.state], self.flow_info))
 
     def _get_all_possible_paths(self):
         """
@@ -284,16 +291,16 @@ class FlowMultipathManager(object):
 
         return selected_paths
 
+    #TODO: define path selection
     def X_select_paths(self, paths):
-        selected_paths = paths[:]
+        selected_paths = sorted(paths, key=lambda x: len(x))
 
         threshold = 2
 
-        # select only subset paths, eliminate paths contains others
         for x in paths:
             delete_list = []
             for y in selected_paths:
-                if len(set(x) - set(y)) < threshold:
+                if set(x) < set(y):
                     delete_list.append(y)
 
             for deleted_item in delete_list:
@@ -396,20 +403,27 @@ class FlowMultipathManager(object):
         except queue.Empty:
             index = -1
             queue_index = -1
-
+        counter = 0
         while index > -1:
             self.last_installed_path_index = self.last_installed_path_index + 1
             current_path_index = index
-
+            counter = counter + 1
+            idle_timeout = self.max_time_period_in_second * counter
             priority = self.lowest_priority + self.last_installed_path_index
 
             selected_path = self.paths_with_ports[current_path_index]
-            rule_set_id = self._create_flow_rules(selected_path, priority, idle_timeout=self.min_timeout_time*2)
+            rule_set_id = self._create_flow_rules(selected_path, priority, idle_timeout=idle_timeout)
             self.active_queue.put_nowait((queue_index, current_path_index, rule_set_id))
+            if logger.isEnabledFor(logging.WARNING):
+                now = datetime.now()
+                expire_timestamp = now.timestamp() + idle_timeout
+                expire_time = datetime.fromtimestamp(expire_timestamp)
+                time_range =  now.strftime("%H:%M:%S.%f")
+                logger.warning(f'{now} - Rule set {rule_set_id} for ({self.src}->{self.dst}) start: [{time_range}] duration: {idle_timeout:02} sec. path: {list(selected_path.keys())}')
 
             self._set_state(FlowMultipathManager.ACTIVE)
-            logger.info(
-                f'Installer - {self.flow_info} Put index:{queue_index} item:{index} into active queue {datetime.now()}')
+            if logger.isEnabledFor(logging.INFO):
+                logger.info(f'Installer - {self.flow_info} Put index:{queue_index} item:{index} into active queue {datetime.now()}')
 
             if self.active_path is None:
                 self.active_path = selected_path
@@ -422,7 +436,7 @@ class FlowMultipathManager(object):
             except queue.Empty:
                 index = -1
 
-        if self.active_path is not None:
+        if self.active_path is not None and self.src in self.active_path:
             first_output_port = self.active_path[self.src][1]
             return first_output_port
         else:
@@ -522,19 +536,19 @@ class FlowMultipathManager(object):
             self.flow_id_rule_set[flow_id] = self.rule_set_id
             stats[flow_id]["flow_params"] = (node, match_ip, actions)
 
-            flow_id = self.multipath_app.add_flow(dp, priority,
-                                                  match_arp, actions,
-                                                  hard_timeout=hard_timeout,
-                                                  idle_timeout=idle_timeout,
-                                                  flags=ofproto.OFPFF_SEND_FLOW_REM,
-                                                  caller=self)
-            timestamp = datetime.timestamp(datetime.now())
-            stats = rule_set["datapath_list"][node]["arp_flow"]
-            self.flow_id_rule_set[flow_id] = self.rule_set_id
-            stats[flow_id] = defaultdict()
-            stats[flow_id]["created_time"] = timestamp
-            stats[flow_id]["removed_time"] = None
-            stats[flow_id]["packet_count"] = None
-            stats[flow_id]["flow_params"] = (node, match_arp, actions)
+            # flow_id = self.multipath_app.add_flow(dp, priority,
+            #                                       match_arp, actions,
+            #                                       hard_timeout=hard_timeout,
+            #                                       idle_timeout=idle_timeout,
+            #                                       flags=ofproto.OFPFF_SEND_FLOW_REM,
+            #                                       caller=self)
+            # timestamp = datetime.timestamp(datetime.now())
+            # stats = rule_set["datapath_list"][node]["arp_flow"]
+            # self.flow_id_rule_set[flow_id] = self.rule_set_id
+            # stats[flow_id] = defaultdict()
+            # stats[flow_id]["created_time"] = timestamp
+            # stats[flow_id]["removed_time"] = None
+            # stats[flow_id]["packet_count"] = None
+            # stats[flow_id]["flow_params"] = (node, match_arp, actions)
 
         return self.rule_set_id
