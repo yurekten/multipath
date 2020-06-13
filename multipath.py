@@ -45,6 +45,7 @@ class MultipathControllerApp(app_manager.RyuApp):
     def __init__(self, multipath_enabled=True, *args, **kwargs):
         super(MultipathControllerApp, self).__init__(*args, **kwargs)
         self.multipath_enabled = multipath_enabled
+
         self.sw_cookie = defaultdict()
         self.unused_cookie = 0x0010000
         self.flow_managers = defaultdict()
@@ -55,47 +56,17 @@ class MultipathControllerApp(app_manager.RyuApp):
 
         self.arp_table = {}
         self.hosts = {}
-        self.broadcast_messages = defaultdict()
 
         self.mac_to_port = {}
-        self.candidate_flows = {}
-
-        #TODO: Optimize parameters
-        self.activation_delay = 1 #start if flow is active 2 seconds
-        self.flow_stats_sampling_period = 0.3
-        self.min_flow_stats_sample = 1
-
-        self.min_packet_in_period = 10
-
-        #hub.spawn(self._monitor_initial_flows)
 
         self.no_flood_ports = None
 
         self.lock = RLock()
-        if self.multipath_enabled:
-            logger.warning("SDN Controleller started - multipath management is ENABLED")
-        else:
-            logger.warning("SDN Controleller started - multipath management is DISABLED")
 
-    def _monitor_initial_flows(self):
-        completed = False
-        while not completed:
-            key_list = list(self.candidate_flows.keys())
-            for (in_port, dst, src, datapath) in key_list:
-                state = self._get_managed_flow_state(in_port, dst, src, datapath)
-                if state == -1:
-                    self._request_flow_packet_count(in_port, dst, src, datapath)
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f'In waiting state: OFPFlowStatsRequest is sent fpr {in_port, dst, src, datapath}')
-                elif state == 0:
-                    del self.candidate_flows[(in_port, dst, src, datapath)]
-                    if logger.isEnabledFor(logging.DEBUG):
-                        logger.debug(f'In expired state: deleted from map {in_port, dst, src, datapath}')
-                elif state == 1:
-                    del self.candidate_flows[(in_port, dst, src, datapath)]
-                    self._start_flow_manager(dst, src)
+        self.activation_delay = 1 # start multipath if flow duration greater than activation_delay
+        self.min_packet_in_period = 10
 
-            hub.sleep(self.flow_stats_sampling_period)
+        logger.warning("SDN Controleller started - multipath enabled:  %s" % self.multipath_enabled)
 
     def _start_flow_manager(self, dst, src):
 
@@ -114,7 +85,6 @@ class MultipathControllerApp(app_manager.RyuApp):
             if logger.isEnabledFor(level=logging.WARNING):
                 logger.warning(f"Initiate flow manager {flow_manager.flow_info} at {datetime.now()}")
 
-
     def flow_manager_is_destroying(self, flow):
         with self.lock:
             if flow.flow_info in self.flow_managers:
@@ -132,32 +102,6 @@ class MultipathControllerApp(app_manager.RyuApp):
         self.sw_cookie[sw_id]["last_flow_cookie"] = self.sw_cookie[sw_id]["last_flow_cookie"] + 1
 
         return self.sw_cookie[sw_id]["last_flow_cookie"]
-
-    def _get_managed_flow_state(self, in_port, dst, src, datapath):
-        packet_statistics = self.candidate_flows[(in_port, dst, src, datapath)]
-
-        last_ind = len(packet_statistics)
-        time_diff = (datetime.now() - packet_statistics[0][0]).total_seconds()
-
-        if time_diff < self.activation_delay:
-            return -1
-
-        if last_ind > self.min_flow_stats_sample:
-            if time_diff > self.activation_delay:
-                index_prev = last_ind - 2
-                index_last = last_ind - 1
-                packet_count = packet_statistics[index_last][1]
-                if packet_count >= self.min_packet_in_period:
-                    return 1
-                else:
-                    return 0
-            else:
-                return -1
-        else:
-            if time_diff < self.activation_delay:
-                return -1
-            else:
-                return 0
 
     def _request_flow_packet_count(self, in_port, dst, src, datapath_id):
         datapath = self.datapath_list[datapath_id]
@@ -198,25 +142,11 @@ class MultipathControllerApp(app_manager.RyuApp):
                     eth_dst = flow.match["eth_dst"]
                 initial = False
 
-        if (in_port, eth_dst, eth_src, datapath_id) in self.candidate_flows:
-            stat = self.candidate_flows[ (in_port, eth_dst, eth_src, datapath_id)]
-            stat.append((datetime.now(), max_packet_count))
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug(f'OFPFlowStatsReply is processed for {in_port, eth_dst, eth_src, datapath_id}: {(datetime.now(), max_packet_count)}')
-
     def get_active_path_port_for(self, src, first_port, dst, last_port, ip_src, ip_dst, current_dpid, eth_src, eth_dst):
         if (src, first_port, dst, last_port, ip_src, ip_dst) in self.flow_managers:
             flow_manager = self.flow_managers[(src, first_port, dst, last_port, ip_src, ip_dst)]
             output_port = flow_manager.get_active_path_port_for(current_dpid)
-            #if logger.isEnabledFor(level=logging.INFO):
-            #    logger.info(f"flow manager for {(src, first_port, dst, last_port, ip_src, ip_dst)} is started")
             return output_port
-
-
-        # if (first_port, eth_dst, eth_src, current_dpid) not in self.candidate_flows:
-        #     self.candidate_flows[(first_port, eth_dst, eth_src, current_dpid)] = []
-        #     self.candidate_flows[(first_port, eth_dst, eth_src, current_dpid)].append((datetime.now(), 0))
-
         return None
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None, hard_timeout=0, flags=0, cookie=0,
@@ -322,7 +252,6 @@ class MultipathControllerApp(app_manager.RyuApp):
         # avoid broadcast from LLDP
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             return
-
 
         if pkt.get_protocol(ipv6.ipv6):
             return
