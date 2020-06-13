@@ -64,6 +64,7 @@ class FlowMultipathManager(object):
 
         self.active_path = None
         self.active_path_index = -1
+        self.forward_with_random_ip = True
 
     @staticmethod
     def date_time_converter(o):
@@ -167,8 +168,7 @@ class FlowMultipathManager(object):
             else:
                 self._update_paths()
                 self._delete_paths()
-
-            hub.sleep(self.max_time_period_in_second / 2)
+                hub.sleep(self.max_time_period_in_second / 2)
         if logger.isEnabledFor(logging.INFO):
             logger.info(f'Path management for {self.flow_info} has exited at {datetime.now()}')
 
@@ -286,24 +286,6 @@ class FlowMultipathManager(object):
                 if set(x) < set(y):
                     superset.append(y)
             for deleted_item in superset:
-                ind = selected_paths.index(deleted_item)
-                del selected_paths[ind]
-
-        return selected_paths
-
-    #TODO: define path selection
-    def X_select_paths(self, paths):
-        selected_paths = sorted(paths, key=lambda x: len(x))
-
-        threshold = 2
-
-        for x in paths:
-            delete_list = []
-            for y in selected_paths:
-                if set(x) < set(y):
-                    delete_list.append(y)
-
-            for deleted_item in delete_list:
                 ind = selected_paths.index(deleted_item)
                 del selected_paths[ind]
 
@@ -473,7 +455,82 @@ class FlowMultipathManager(object):
             except queue.Empty:
                 rule_set_id = -1
 
+    def _create_match_actions_for(self, path):
+        match_actions = {}
+        for node in path:
+            dp = self.dp_list[node]
+            ofproto = dp.ofproto
+            ofp_parser = dp.ofproto_parser
+
+            in_port = path[node][0]
+
+            match_ip = ofp_parser.OFPMatch(
+                eth_type=0x0800,
+                ipv4_src=self.ip_src,
+                ipv4_dst=self.ip_dst,
+                in_port=in_port
+            )
+            actions = [ofp_parser.OFPActionOutput(path[node][1])]
+            match_actions[node] = (match_ip, actions)
+        if self.forward_with_random_ip:
+            pass
+
+        return match_actions
+
+
     def _create_flow_rules(self, current_path, priority, hard_timeout=0, idle_timeout=0):
+        self.rule_set_id = self.rule_set_id + 1
+        self.statistics["rule_set"][self.rule_set_id] = defaultdict()
+
+        rule_set = self.statistics["rule_set"][self.rule_set_id]
+        rule_set["path"] = current_path
+        rule_set["datapath_list"] = defaultdict()
+        rule_set["flow_info"] = self.flow_info
+        rule_set["max_ip_packet_count"] = -1
+        rule_set["max_arp_packet_count"] = -1
+        rule_set["deleted_ip_flow_count"] = 0
+        rule_set["deleted_arp_flow_count"] = 0
+
+        match_actions = self._create_match_actions_for(current_path)
+        first = None
+        install_path_ordered = defaultdict()
+        for node in current_path:
+            if first is None:
+                first = node
+                continue
+            install_path_ordered[node] = current_path[node]
+
+        install_path_ordered[first] = current_path[first]
+        for node in install_path_ordered:
+            if node not in rule_set["datapath_list"]:
+                rule_set["datapath_list"][node] = defaultdict()
+                rule_set["datapath_list"][node]["ip_flow"] = defaultdict()
+                rule_set["datapath_list"][node]["arp_flow"] = defaultdict()
+
+            dp = self.dp_list[node]
+            ofproto = dp.ofproto
+            match = match_actions[node][0]
+            actions = match_actions[node][1]
+            flow_id = self.multipath_app.add_flow(dp, priority,
+                                                  match, actions,
+                                                  hard_timeout=hard_timeout,
+                                                  idle_timeout=idle_timeout,
+                                                  flags=ofproto.OFPFF_SEND_FLOW_REM,
+                                                  caller=self)
+
+            stats = rule_set["datapath_list"][node]["ip_flow"]
+            timestamp = datetime.timestamp(datetime.now())
+            stats[flow_id] = defaultdict()
+            stats[flow_id]["created_time"] = timestamp
+            stats[flow_id]["removed_time"] = None
+            stats[flow_id]["packet_count"] = None
+            self.flow_id_rule_set[flow_id] = self.rule_set_id
+            stats[flow_id]["flow_params"] = (node, match, actions)
+
+
+        return self.rule_set_id
+
+    def _old_create_flow_rules(self, current_path, priority, hard_timeout=0, idle_timeout=0):
         self.rule_set_id = self.rule_set_id + 1
         self.statistics["rule_set"][self.rule_set_id] = defaultdict()
 
