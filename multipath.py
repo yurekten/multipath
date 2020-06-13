@@ -42,9 +42,22 @@ logger.setLevel(level=logging.WARNING)
 class MultipathControllerApp(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_4.OFP_VERSION]
 
-    def __init__(self, multipath_enabled=True, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super(MultipathControllerApp, self).__init__(*args, **kwargs)
-        self.multipath_enabled = multipath_enabled
+
+        self.multipath_enabled = True  # If True, multipath functions enabled else, all switches work as L2 switch
+        self.activation_delay = 1  # (sec.) flow is checked after activation_delay to active multipath
+        self.min_packet_in_period = 10 # After activation delay, Multipath starts if flow packet count is greater than min_packet_in_period
+        self.multipath_params = {  # if multipath_enabled is enabled, it defines parameters of multipath manager
+                  'forward_with_random_ip': True, #random ip generation is activated.
+                  'random_ip_subnet':"10.93.0.0", #random ip subnet, default mask is 255.255.0.0
+                  'random_ip_for_each_hop': False, # if False, first node generates random ip
+                  'max_random_paths': 50, # maximum random paths used in multipath manager
+                  'max_installed_path_count': 3, # maximum flow count installed in switch for each path
+                  'max_time_period_in_second': 1, # random path expire time in seconds.
+                  'lowest_flow_priority': 20000 # minimum flow priority in random path flows
+                  }
+
 
         self.sw_cookie = defaultdict()
         self.unused_cookie = 0x0010000
@@ -63,9 +76,6 @@ class MultipathControllerApp(app_manager.RyuApp):
 
         self.lock = RLock()
 
-        self.activation_delay = 1 # start multipath if flow duration greater than activation_delay
-        self.min_packet_in_period = 10
-
         logger.warning("SDN Controleller started - multipath enabled:  %s" % self.multipath_enabled)
 
     def _start_flow_manager(self, dst, src):
@@ -79,7 +89,8 @@ class MultipathControllerApp(app_manager.RyuApp):
 
             dp_list = self.datapath_list
 
-            flow_manager = FlowMultipathManager(self, self.topology, dp_list, h1[0], h1[1], h2[0], h2[1], h1[2], h2[2])
+            flow_manager = FlowMultipathManager(self, self.topology, dp_list, h1[0], h1[1], h2[0], h2[1], h1[2], h2[2],
+                                                **self.multipath_params)
             self.flow_managers[flow_manager.flow_info] = flow_manager
             flow_manager.get_active_path_port_for(dp_list[h1[0]])
             if logger.isEnabledFor(level=logging.WARNING):
@@ -202,7 +213,6 @@ class MultipathControllerApp(app_manager.RyuApp):
         match1 = ofp_parser.OFPMatch(eth_type=0x86DD)  # IPv6
         self.add_flow(datapath, 999, match1, actions, flags=0)
 
-
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, MAIN_DISPATCHER)
     def port_desc_stats_reply_handler(self, ev):
         switch = ev.msg.datapath
@@ -270,7 +280,6 @@ class MultipathControllerApp(app_manager.RyuApp):
         arp_pkt = pkt.get_protocol(arp.arp)
         ip_pkt = pkt.get_protocol(ipv4.ipv4)
 
-
         if arp_pkt:
             src_ip = arp_pkt.src_ip
             dst_ip = arp_pkt.dst_ip
@@ -279,7 +288,7 @@ class MultipathControllerApp(app_manager.RyuApp):
             src_ip = ip_pkt.src
             dst_ip = ip_pkt.dst
         else:
-            #ignore other packets
+            # ignore other packets
             return
 
         if src not in self.hosts:
@@ -290,7 +299,7 @@ class MultipathControllerApp(app_manager.RyuApp):
             h1 = self.hosts[src]
             h2 = self.hosts[dst]
             if h1[0] == dpid:
-                #if self._can_be_managed_flow(in_port, dst, src, h1[0]):
+                # if self._can_be_managed_flow(in_port, dst, src, h1[0]):
                 out_port = self.get_active_path_port_for(h1[0], h1[1], h2[0], h2[1], src_ip, dst_ip, dpid, src, dst)
         if out_port is None:
             if dst in self.mac_to_port[dpid]:
@@ -303,7 +312,8 @@ class MultipathControllerApp(app_manager.RyuApp):
             actions = [parser.OFPActionOutput(out_port)]
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
             if self.multipath_enabled:
-                self.add_flow(datapath, 3, match, actions, hard_timeout=self.activation_delay, flags=ofproto.OFPFF_SEND_FLOW_REM)
+                self.add_flow(datapath, 3, match, actions, hard_timeout=self.activation_delay,
+                              flags=ofproto.OFPFF_SEND_FLOW_REM)
 
             self.add_flow(datapath, 1, match, actions, idle_timeout=(self.activation_delay + 2))
         else:
@@ -328,7 +338,7 @@ class MultipathControllerApp(app_manager.RyuApp):
 
     def _recalculate_flood_ports(self):
         nodes = list(self.topology.nodes)
-        edges =list(self.topology.edges)
+        edges = list(self.topology.edges)
         graph = nx.Graph()
         graph.add_nodes_from(nodes)
         graph.add_edges_from(edges)
@@ -387,7 +397,6 @@ class MultipathControllerApp(app_manager.RyuApp):
         if self.no_flood_ports is not None:
             self._recalculate_flood_ports()
 
-
     @set_ev_cls(event.EventLinkDelete, MAIN_DISPATCHER)
     def link_delete_handler(self, ev):
         if logger.isEnabledFor(level=logging.INFO):
@@ -424,4 +433,3 @@ class MultipathControllerApp(app_manager.RyuApp):
 
                     if eth_src is not None and eth_dst is not None:
                         self._start_flow_manager(eth_dst, eth_src)
-

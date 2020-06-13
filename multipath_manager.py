@@ -10,6 +10,7 @@ import networkx as nx
 import logging
 
 from ryu.lib import hub
+from ryu.lib.packet import ether_types
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -25,9 +26,13 @@ class FlowMultipathManager(object):
     DEAD = 4
     STATES = { 0: "NOT_ACTIVE", 1:"INITIATED", 2:"ACTIVE", 3:"DESTROYING", 4:"DEAD"}
 
-    def __init__(self, multipath_app, graph, dp_list, src, first_port, dst, last_port, ip_src, ip_dst, max_paths=100,
-                 max_installed_path_count=2, max_time_period_in_second=1, lowest_priority=30000):
+    def __init__(self, multipath_app, graph, dp_list, src, first_port, dst, last_port, ip_src, ip_dst, 
+                 max_random_paths=100, lowest_flow_priority=30000, 
+                 max_installed_path_count=2, max_time_period_in_second=2, 
+                 forward_with_random_ip=True, random_ip_subnet="10.93.0.0", random_ip_for_each_hop=True,
+                 *args, **kwargs):
         self.state = FlowMultipathManager.NOT_ACTIVE
+
         self.multipath_app = multipath_app
         self.topology = graph
         self.dp_list = dp_list
@@ -37,11 +42,16 @@ class FlowMultipathManager(object):
         self.last_port = last_port
         self.ip_src = ip_src
         self.ip_dst = ip_dst
-        self.max_paths = max_paths
+        
         self.max_installed_path_count = max_installed_path_count
         self.max_time_period_in_second = max_time_period_in_second
-        self.lowest_priority = lowest_priority
-
+        self.max_random_paths = max_random_paths
+        self.lowest_flow_priority = lowest_flow_priority
+        self.forward_with_random_ip = forward_with_random_ip
+        self.random_ip_for_each_hop = random_ip_for_each_hop
+        self.random_ip_subnet = random_ip_subnet
+        sub_address_nodes = random_ip_subnet.split(".")
+        self.random_ip_subnet_prefix  = sub_address_nodes[0] + "." + sub_address_nodes[1]
         self.flow_info = (src, first_port, dst, last_port, ip_src, ip_dst,)
 
         self.optimal_paths = None
@@ -64,7 +74,6 @@ class FlowMultipathManager(object):
 
         self.active_path = None
         self.active_path_index = -1
-        self.forward_with_random_ip = True
 
     @staticmethod
     def date_time_converter(o):
@@ -152,7 +161,7 @@ class FlowMultipathManager(object):
             logger.warning(f'Path management thread has started at {datetime.now()}')
         completed = False
         while not completed:
-            if self.state == FlowMultipathManager.DESTROYING:
+            if self.state == FlowMultipathManager.DESTROYING or self.state == FlowMultipathManager.DEAD:
                 self._delete_paths()
                 if self.active_queue.qsize() == 0:
                     self._set_state(FlowMultipathManager.DEAD)
@@ -164,7 +173,7 @@ class FlowMultipathManager(object):
                     #with open("reports/%s" % file_name, 'w') as outfile:
                     #    json.dump(self.statistics, outfile, default=FlowMultipathManager.date_time_converter)
 
-                    completed = True
+                completed = True
             else:
                 self._update_paths()
                 self._delete_paths()
@@ -177,7 +186,7 @@ class FlowMultipathManager(object):
         if logger.isEnabledFor(logging.WARNING):
             logger.warning(f'{datetime.now()} - Timing thread has started')
         while not completed:
-            if self.state == FlowMultipathManager.DESTROYING:
+            if self.state == FlowMultipathManager.DESTROYING or self.state == FlowMultipathManager.DEAD:
                 exit_loop = False
                 while not exit_loop:
                     try:
@@ -190,6 +199,7 @@ class FlowMultipathManager(object):
                     except queue.Empty:
                         exit_loop = True
 
+                self._set_state(FlowMultipathManager.DEAD)
                 completed = True
             else:
                 started_item_count = self.initiated_queue.qsize() + self.active_queue.qsize()
@@ -319,7 +329,7 @@ class FlowMultipathManager(object):
 
         start = time.perf_counter()
         paths = self._get_all_possible_paths()
-        paths_count = len(paths) if len(paths) < self.max_paths else self.max_paths
+        paths_count = len(paths) if len(paths) < self.max_random_paths else self.max_random_paths
 
         sorted_paths = sorted(paths, key=lambda x: x[1])[0:paths_count]
         self.optimal_paths = sorted_paths
@@ -391,7 +401,7 @@ class FlowMultipathManager(object):
             current_path_index = index
             counter = counter + 1
             idle_timeout = self.max_time_period_in_second * counter
-            priority = self.lowest_priority + self.last_installed_path_index
+            priority = self.lowest_flow_priority + self.last_installed_path_index
 
             selected_path = self.paths_with_ports[current_path_index]
             rule_set_id = self._create_flow_rules(selected_path, priority, idle_timeout=idle_timeout)
@@ -455,22 +465,79 @@ class FlowMultipathManager(object):
             except queue.Empty:
                 rule_set_id = -1
 
+    def create_random_ip(self):
+        return self.random_ip_subnet_prefix + "." + str(random.randint(1, 254)) + "." + str(random.randint(1, 254))
+
     def _create_match_actions_for(self, path):
         match_actions = {}
+        path_size = len(path)
+        path_ind = -1
+
+        src_rand_ip = self.create_random_ip()
+        dst_rand_ip = self.create_random_ip()
+
         for node in path:
+            path_ind = path_ind + 1
             dp = self.dp_list[node]
-            ofproto = dp.ofproto
             ofp_parser = dp.ofproto_parser
 
             in_port = path[node][0]
+            output_action = ofp_parser.OFPActionOutput(path[node][1])
+            if self.forward_with_random_ip and path_size > 1:
+                if path_ind == 0:
+                    match_ip = ofp_parser.OFPMatch(
+                        eth_type=ether_types.ETH_TYPE_IP,
+                        ipv4_src=self.ip_src,
+                        ipv4_dst=self.ip_dst,
+                        in_port=in_port
+                    )
+                    src_rand_ip = self.create_random_ip()
+                    change_src_ip = ofp_parser.OFPActionSetField(ipv4_src=src_rand_ip)
 
-            match_ip = ofp_parser.OFPMatch(
-                eth_type=0x0800,
-                ipv4_src=self.ip_src,
-                ipv4_dst=self.ip_dst,
-                in_port=in_port
-            )
-            actions = [ofp_parser.OFPActionOutput(path[node][1])]
+                    dst_rand_ip = self.create_random_ip()
+                    change_dst_ip = ofp_parser.OFPActionSetField(ipv4_dst=dst_rand_ip)
+
+                    actions = [change_src_ip, change_dst_ip, output_action]
+
+                elif path_ind >= path_size -1:
+                    match_ip = ofp_parser.OFPMatch(
+                        eth_type=ether_types.ETH_TYPE_IP,
+                        ipv4_src=src_rand_ip,
+                        ipv4_dst=dst_rand_ip,
+                        in_port=in_port
+                    )
+
+                    change_src_ip = ofp_parser.OFPActionSetField(ipv4_src=self.ip_src)
+                    change_dst_ip = ofp_parser.OFPActionSetField(ipv4_dst=self.ip_dst)
+
+                    actions = [change_src_ip, change_dst_ip, output_action]
+                else:
+                    match_ip = ofp_parser.OFPMatch(
+                        eth_type=ether_types.ETH_TYPE_IP,
+                        ipv4_src=src_rand_ip,
+                        ipv4_dst=dst_rand_ip,
+                        in_port=in_port
+                    )
+                    if self.random_ip_for_each_hop:
+                        src_rand_ip = self.create_random_ip()
+                        change_src_ip = ofp_parser.OFPActionSetField(ipv4_src=src_rand_ip)
+
+                        dst_rand_ip = self.create_random_ip()
+                        change_dst_ip = ofp_parser.OFPActionSetField(ipv4_dst=dst_rand_ip)
+
+                        actions = [change_src_ip, change_dst_ip, output_action]
+                    else:
+                        actions = [output_action]
+
+            else:
+                match_ip = ofp_parser.OFPMatch(
+                    eth_type=ether_types.ETH_TYPE_IP,
+                    ipv4_src=self.ip_src,
+                    ipv4_dst=self.ip_dst,
+                    in_port=in_port
+                )
+                actions = [output_action]
+
             match_actions[node] = (match_ip, actions)
         if self.forward_with_random_ip:
             pass
