@@ -1,10 +1,10 @@
+import functools
 import json
 import pathlib
 import subprocess
 from datetime import datetime
 from random import random
 from threading import RLock
-
 from ryu.base import app_manager
 from ryu.controller import mac_to_port
 from ryu.controller import ofp_event
@@ -61,7 +61,7 @@ class MultipathControllerApp(app_manager.RyuApp):
                   'random_ip_subnet':"10.93.0.0", #random ip subnet, default mask is 255.255.0.0
                   'max_random_paths': 200, # maximum random paths used in multipath manager
                   'max_installed_path_count': 2, # maximum flow count installed in switch for each path
-                  'max_time_period_in_second': 3, # random path expire time in seconds.
+                  'max_time_period_in_second': 2, # random path expire time in seconds.
                   'lowest_flow_priority': 20000, # minimum flow priority in random path flows
                   'report_folder' : self.multipath_report_folder
                   }
@@ -283,10 +283,6 @@ class MultipathControllerApp(app_manager.RyuApp):
     def _packet_in_handler(self, ev):
         msg = ev.msg
 
-        datapath = msg.datapath
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        in_port = msg.match['in_port']
 
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
@@ -297,6 +293,9 @@ class MultipathControllerApp(app_manager.RyuApp):
         if pkt.get_protocol(ipv6.ipv6):
             return
 
+        datapath = msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
         dst = eth.dst
         src = eth.src
         dpid = datapath.id
@@ -304,6 +303,7 @@ class MultipathControllerApp(app_manager.RyuApp):
         if dpid not in self.mac_to_port:
             self.mac_to_port[dpid] = {}
 
+        in_port = msg.match['in_port']
         logger.debug("packet in %s %s %s %s", dpid, src, dst, in_port)
 
         # learn a mac address to avoid FLOOD next time.
@@ -339,48 +339,28 @@ class MultipathControllerApp(app_manager.RyuApp):
                 out_port = self.mac_to_port[dpid][dst]
             else:
                 out_port = ofproto.OFPP_FLOOD
-
+        actions = [parser.OFPActionOutput(out_port)]
         # install a flow to avoid packet_in next time
         if out_port != ofproto.OFPP_FLOOD:
-            actions = [parser.OFPActionOutput(out_port)]
-            match = parser.OFPMatch(
-                eth_type=ether_types.ETH_TYPE_IP,
-                ipv4_src=src_ip,
-                ipv4_dst=dst_ip,
-                in_port=in_port
-            )
-
-            #match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
             if self.multipath_enabled:
                 priority = 3
                 flags = ofproto.OFPFF_SEND_FLOW_REM
-                flow_id = self.add_flow(datapath, priority, match, actions, hard_timeout=self.activation_delay, flags=flags)
-                if self.watch_generated_flows:
-                    if dpid not in self.statistics["flows"]:
-                        self.statistics["flows"][dpid] = {}
-                    self.statistics["flows"][dpid][flow_id] = {"match": match,
-                                                               "actions": actions,
-                                                               "priority": priority,
-                                                               "idle_timeout": self.activation_delay,
-                                                               "created": datetime.now().timestamp(),
-                                                               "datapath_id": dpid
-                                                               }
+                hard_timeout = self.activation_delay
+                idle_timeout = 0
+                self._create_rule_if_not_exist(dpid, src_ip, dst_ip, in_port, out_port, priority, flags,
+                                               hard_timeout, idle_timeout)
+
             priority = 1
             idle_timeout = (self.activation_delay + 2)
+            hard_timeout = 0
             if self.watch_generated_flows:
                 flags = ofproto.OFPFF_SEND_FLOW_REM
-                flow_id = self.add_flow(datapath, priority, match, actions, idle_timeout=idle_timeout, flags=flags)
-                if dpid not in self.statistics["flows"]:
-                    self.statistics["flows"][dpid] = {}
-                self.statistics["flows"][dpid][flow_id] = {"match": match,
-                                                     "actions": actions,
-                                                     "priority": priority,
-                                                     "idle_timeout": idle_timeout,
-                                                     "created": datetime.now().timestamp(),
-                                                     "datapath_id":dpid
-                                                     }
+                self._create_rule_if_not_exist(dpid, src_ip, dst_ip, in_port, out_port, priority, flags,
+                                               hard_timeout, idle_timeout)
             else:
-                flow_id = self.add_flow(datapath, priority, match, actions, idle_timeout=idle_timeout, flags=0)
+                flags = 0
+                self._create_rule_if_not_exist(dpid, src_ip, dst_ip, in_port, out_port, priority, flags,
+                                               hard_timeout, idle_timeout)
         else:
             if self.no_flood_ports is None:
                 self._recalculate_flood_ports()
@@ -400,6 +380,36 @@ class MultipathControllerApp(app_manager.RyuApp):
         out = parser.OFPPacketOut(datapath=datapath, buffer_id=msg.buffer_id,
                                   in_port=in_port, actions=actions, data=data)
         datapath.send_msg(out)
+
+    @functools.lru_cache(maxsize=16, typed=False)
+    def _create_rule_if_not_exist(self, dpid, src_ip, dst_ip, in_port, out_port, priority, flags, hard_timeout, idle_timeout):
+        datapath = self.datapath_list[dpid]
+        parser = datapath.ofproto_parser
+
+        actions = [parser.OFPActionOutput(out_port)]
+        match = parser.OFPMatch(
+            eth_type=ether_types.ETH_TYPE_IP,
+            ipv4_src=src_ip,
+            ipv4_dst=dst_ip,
+            in_port=in_port
+        )
+
+        flow_id = self.add_flow(datapath, priority, match, actions, hard_timeout=hard_timeout, flags=flags,
+                                idle_timeout=idle_timeout)
+        if self.watch_generated_flows:
+            if dpid not in self.statistics["flows"]:
+                self.statistics["flows"][dpid] = {}
+                self.statistics["flows"][dpid][flow_id] = {"match": match,
+                                                       "actions": actions,
+                                                       "priority": priority,
+                                                       "idle_timeout": idle_timeout,
+                                                       "hard_timeout": hard_timeout,
+                                                       "created": datetime.now().timestamp(),
+                                                       "datapath_id": dpid
+                                                       }
+        return flow_id
+
+
 
     def _recalculate_flood_ports(self):
         nodes = list(self.topology.nodes)

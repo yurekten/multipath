@@ -214,7 +214,8 @@ class FlowMultipathManager(object):
                         #if max_ip_packet <= 0 and max_arp_packet <= 0:
                         if max_ip_packet <= 0:
                             self.statistics["idle_count"] = self.statistics["idle_count"] + 1
-                            self._set_state(FlowMultipathManager.DESTROYING)
+                            if self.statistics["idle_count"] > 1:
+                                self._set_state(FlowMultipathManager.DESTROYING)
                         else:
                             self.statistics["idle_count"] = 0
 
@@ -739,6 +740,7 @@ class FlowMultipathManager(object):
             stats[flow_id]["created_time"] = timestamp
             stats[flow_id]["removed_time"] = None
             stats[flow_id]["packet_count"] = None
+            stats[flow_id]["byte_count"] = None
             self.flow_id_rule_set[flow_id] = self.rule_set_id
             stats[flow_id]["flow_params"] = (node, match, actions)
 
